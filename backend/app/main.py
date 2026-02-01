@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
+import sqlite3
+import json
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,12 +38,58 @@ class ChatResponse(BaseModel):
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SQLITE_URL = f"sqlite:///{(DATA_DIR / 'memory.sqlite').as_posix()}"
+RAG_DB_PATH = DATA_DIR / "rag.sqlite"
 
 load_dotenv()
 
 def get_message_history(session_id: str) -> SQLChatMessageHistory:
     return SQLChatMessageHistory(connection_string=SQLITE_URL, session_id=session_id)
 
+class RAGStore:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _conn(self):
+        return sqlite3.connect(self.db_path.as_posix())
+
+    def _init_db(self):
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(content, metadata)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def add(self, content: str, metadata: Optional[Dict] = None):
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            meta_str = json.dumps(metadata or {}, ensure_ascii=False)
+            cur.execute("INSERT INTO docs(content, metadata) VALUES (?, ?)", (content, meta_str))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def search(self, query: str, k: int = 5) -> List[Dict]:
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            # 简单 MATCH 查询；若 SQLite 未启用 bm25，则使用默认顺序
+            q = (query or "").replace("？", " ").replace("?", " ").replace('"', " ").replace("'", " ")
+            if not q.strip():
+                return []
+            try:
+                cur.execute(f'SELECT content, metadata FROM docs WHERE docs MATCH "{q}" LIMIT {int(k)}')
+            except sqlite3.Error:
+                return []
+            rows = cur.fetchall()
+            return [{"content": r[0], "metadata": json.loads(r[1] or "{}")} for r in rows]
+        finally:
+            conn.close()
+
+rags = RAGStore(RAG_DB_PATH)
 
 class SimpleResponder:
     def invoke(self, inputs):
@@ -62,7 +110,7 @@ class SimpleResponder:
 def build_chain():
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", "你是一个有用的中文助手，会结合对话记忆回答问题。"),
+            ("system", "你是一个有用的中文助手，会结合对话记忆回答问题。\n以下是检索到的知识片段，若相关请参考回答：\n{context}"),
             MessagesPlaceholder(variable_name="history"),
             ("human", "{input}"),
         ]
@@ -93,7 +141,8 @@ app = FastAPI(title="ChatBot with Memory")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://127.0.0.1:5173"],
+    allow_origin_regex=r"http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -105,12 +154,14 @@ def chat(req: ChatRequest) -> ChatResponse:
     if not req.session_id or not req.message:
         raise HTTPException(status_code=400, detail="session_id 与 message 均为必填")
     chain = build_chain()
+    docs = rags.search(req.message, k=5)
+    context = "\n\n".join([d["content"] for d in docs]) if docs else "（未检索到相关片段）"
     try:
-        reply = chain.invoke({"input": req.message}, config={"configurable": {"session_id": req.session_id}})
+        reply = chain.invoke({"input": req.message, "context": context}, config={"configurable": {"session_id": req.session_id}})
     except Exception:
         prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", "你是一个有用的中文助手，会结合对话记忆回答问题。"),
+                ("system", "你是一个有用的中文助手，会结合对话记忆回答问题。\n以下是检索到的知识片段，若相关请参考回答：\n{context}"),
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "{input}"),
             ]
@@ -124,7 +175,7 @@ def chat(req: ChatRequest) -> ChatResponse:
             input_messages_key="input",
             history_messages_key="history",
         )
-        reply = fb_with_history.invoke({"input": req.message}, config={"configurable": {"session_id": req.session_id}})
+        reply = fb_with_history.invoke({"input": req.message, "context": context}, config={"configurable": {"session_id": req.session_id}})
     return ChatResponse(session_id=req.session_id, reply=reply)
 
 @app.get("/api/chat/stream")
@@ -132,10 +183,12 @@ def chat_stream(session_id: str, message: str, request: Request):
     if not session_id or not message:
         raise HTTPException(status_code=400, detail="session_id 与 message 均为必填")
     chain = build_chain()
+    docs = rags.search(message, k=5)
+    context = "\n\n".join([d["content"] for d in docs]) if docs else "（未检索到相关片段）"
 
     def event_generator():
         try:
-            for chunk in chain.stream({"input": message}, config={"configurable": {"session_id": session_id}}):
+            for chunk in chain.stream({"input": message, "context": context}, config={"configurable": {"session_id": session_id}}):
                 if chunk is None:
                     continue
                 yield f"data: {str(chunk)}\n\n"
@@ -145,6 +198,21 @@ def chat_stream(session_id: str, message: str, request: Request):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+class IngestRequest(BaseModel):
+    content: str
+    metadata: Optional[Dict] = None
+
+@app.post("/api/rag/ingest")
+def rag_ingest(req: IngestRequest):
+    if not req.content or len(req.content.strip()) == 0:
+        raise HTTPException(status_code=400, detail="content 必填")
+    rags.add(req.content.strip(), req.metadata or {})
+    return {"ok": True}
+
+@app.get("/api/rag/search")
+def rag_search(q: str, k: int = 5):
+    items = rags.search(q, k)
+    return items
 
 @app.get("/api/history/{session_id}")
 def get_history(session_id: str):

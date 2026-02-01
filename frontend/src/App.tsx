@@ -4,6 +4,7 @@ import { DeleteOutlined, SendOutlined } from "@ant-design/icons";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 
 type ChatItem = {
   role: "human" | "ai" | "assistant" | "system";
@@ -23,6 +24,17 @@ export default function App() {
   const [messages, setMessages] = useState<ChatItem[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [kbText, setKbText] = useState("");
+  const [kbLoading, setKbLoading] = useState(false);
+
+  const normalizeMdPreview = (text: string, inStreaming: boolean) => {
+    if (!inStreaming) return text;
+    let t = text || "";
+    if (!t.endsWith("\n")) t += "\n";
+    const fenceCount = (t.match(/```/g) || []).length;
+    if (fenceCount % 2 === 1) t += "```\n";
+    return t;
+  };
 
   useEffect(() => {
     (async () => {
@@ -97,21 +109,55 @@ export default function App() {
         </Space>
       </Layout.Header>
       <Layout.Content style={{ padding: 24 }}>
+        <Space style={{ marginBottom: 16 }}>
+          <Input.TextArea
+            value={kbText}
+            onChange={(e) => setKbText(e.target.value)}
+            autoSize={{ minRows: 2, maxRows: 4 }}
+            placeholder="输入知识库文本（提交后用于检索增强）"
+            style={{ width: 600 }}
+          />
+          <Button
+            loading={kbLoading}
+            onClick={async () => {
+              const text = kbText.trim();
+              if (!text) return;
+              setKbLoading(true);
+              try {
+                await axios.post("/api/rag/ingest", { content: text, metadata: { source: "manual" } });
+                setKbText("");
+                antdMessage.success("已加入知识库");
+              } catch {
+                antdMessage.error("加入知识库失败");
+              } finally {
+                setKbLoading(false);
+              }
+            }}
+          >
+            加入知识库
+          </Button>
+        </Space>
         <List
           bordered
           dataSource={messages}
-          renderItem={(item) => (
+          renderItem={(item, idx) => {
+            const isStreamingAssistant = loading && idx === messages.length - 1 && item.role === "assistant";
+            const mdText = normalizeMdPreview(item.content, isStreamingAssistant);
+            return (
             <List.Item>
               <Space direction="vertical" style={{ width: "100%" }}>
                 <Typography.Text strong>
                   {item.role === "human" ? "我" : item.role === "assistant" ? "助手" : item.role}
                 </Typography.Text>
                 <div style={{ marginBottom: 0 }}>
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+                    {mdText}
+                  </ReactMarkdown>
                 </div>
               </Space>
             </List.Item>
-          )}
+            );
+          }}
           style={{ marginBottom: 16 }}
         />
         <Space.Compact style={{ width: "100%" }}>
