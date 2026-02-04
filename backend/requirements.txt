@@ -8,3 +8,5 @@ langchain-openai==0.2.4
 python-dotenv==1.0.1
 sqlalchemy==2.0.35
 dashscope==1.19.1
+mcp
+httpx
