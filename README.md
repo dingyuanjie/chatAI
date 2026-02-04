@@ -4,14 +4,20 @@
 
 本项目包含一个 Model Context Protocol (MCP) 服务器，提供天气查询功能。
 
+## MCP Server (Windows Shell)
+
+本项目还包含一个支持在 Windows 系统上执行 Shell 命令的 MCP 服务器。
+
+> **⚠️ 警告**: 此服务器允许执行任意系统命令。请仅在受信任的环境中使用，并小心操作。
+
 ### 功能
 
-- **get_weather**: 查询全球任意城市的天气情况（包括温度、湿度、风速）。
-  - 数据源：Open-Meteo (无需 API Key)
+- **run_command**: 执行 Windows 命令行指令 (cmd.exe 环境)。
+  - 参数: `command` (命令字符串), `cwd` (可选工作目录)
 
 ### 安装依赖
 
-在使用之前，请确保安装了必要的 Python 依赖：
+两个 MCP 服务器共用相同的依赖：
 
 ```bash
 cd backend
@@ -20,13 +26,7 @@ pip install -r requirements.txt
 
 ### 配置指南 (Claude Desktop)
 
-要将此 MCP 服务器连接到 Claude Desktop，请按照以下步骤操作：
-
-1. 打开 Claude Desktop 配置文件：
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-2. 添加 `weather-service` 配置：
+你可以同时配置多个 MCP 服务器。请将以下内容合并到你的配置文件中：
 
 ```json
 {
@@ -34,18 +34,22 @@ pip install -r requirements.txt
     "weather-service": {
       "command": "python",
       "args": ["ABSOLUTE_PATH_TO_YOUR_PROJECT/backend/mcp_server.py"]
+    },
+    "windows-shell": {
+      "command": "python",
+      "args": ["ABSOLUTE_PATH_TO_YOUR_PROJECT/backend/mcp_shell.py"]
     }
   }
 }
 ```
 
 请将 `ABSOLUTE_PATH_TO_YOUR_PROJECT` 替换为项目的实际绝对路径。
-例如：`D:\\newData\\chatAI\\backend\\mcp_server.py`
+例如：`D:\\newData\\chatAI\\backend\\mcp_shell.py`
 
 ### 调试
 
-你可以通过以下命令检查服务器是否能正常启动（无报错即正常，因为它等待 stdio 输入）：
+调试 Shell 服务器：
 
 ```bash
-python backend/mcp_server.py
+python backend/mcp_shell.py
 ```
