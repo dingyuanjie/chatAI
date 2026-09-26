@@ -14,15 +14,10 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import BaseMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.runnables import RunnableLambda
+
 
 from langchain_community.chat_message_histories import SQLChatMessageHistory
-from langchain_community.chat_models import ChatTongyi
-
-try:
-    from langchain_openai import ChatOpenAI
-except Exception:
-    ChatOpenAI = None
+from langchain_openai import ChatOpenAI
 
 
 class ChatRequest(BaseModel):
@@ -40,7 +35,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 SQLITE_URL = f"sqlite:///{(DATA_DIR / 'memory.sqlite').as_posix()}"
 RAG_DB_PATH = DATA_DIR / "rag.sqlite"
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 def get_message_history(session_id: str) -> SQLChatMessageHistory:
     return SQLChatMessageHistory(connection_string=SQLITE_URL, session_id=session_id)
@@ -91,22 +86,6 @@ class RAGStore:
 
 rags = RAGStore(RAG_DB_PATH)
 
-class SimpleResponder:
-    def invoke(self, inputs):
-        if isinstance(inputs, list):
-            msg = ""
-            for m in inputs[::-1]:
-                if hasattr(m, "content"):
-                    msg = m.content
-                    break
-            text = msg
-        elif isinstance(inputs, dict):
-            text = inputs.get("input") or ""
-        else:
-            text = str(inputs)
-        return f"收到：{text}。当前未配置外部模型，返回示例回复。"
-
-
 def build_chain():
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -115,17 +94,15 @@ def build_chain():
             ("human", "{input}"),
         ]
     )
-    model = None
-    api_key = os.getenv("OPENAI_API_KEY")
-    model_name = os.getenv("MODEL_NAME") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-    base_url = os.getenv("OPENAI_API_BASE")
-    use_dashscope = base_url and "dashscope" in base_url.lower()
-    if use_dashscope and api_key:
-        model = ChatTongyi(model=model_name, dashscope_api_key=api_key)
-    elif ChatOpenAI and api_key:
-        model = ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url, temperature=0.3)
-    else:
-        model = RunnableLambda(lambda pv: SimpleResponder().invoke(pv.to_messages()))
+    model = ChatOpenAI(
+        model=os.getenv("LOCAL_MODEL") or "chatai-local",
+        api_key="ollama",
+        base_url=os.getenv("OLLAMA_BASE_URL") or "http://127.0.0.1:11434/v1",
+        temperature=0.3,
+        max_tokens=4096,
+        timeout=180,
+        max_retries=0,
+    )
     parser = StrOutputParser()
     chain = prompt | model | parser
     with_history = RunnableWithMessageHistory(
@@ -158,24 +135,8 @@ def chat(req: ChatRequest) -> ChatResponse:
     context = "\n\n".join([d["content"] for d in docs]) if docs else "（未检索到相关片段）"
     try:
         reply = chain.invoke({"input": req.message, "context": context}, config={"configurable": {"session_id": req.session_id}})
-    except Exception:
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", "你是一个有用的中文助手，会结合对话记忆回答问题。\n以下是检索到的知识片段，若相关请参考回答：\n{context}"),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", "{input}"),
-            ]
-        )
-        fb_model = RunnableLambda(lambda pv: SimpleResponder().invoke(pv.to_messages()))
-        parser = StrOutputParser()
-        fb_chain = prompt | fb_model | parser
-        fb_with_history = RunnableWithMessageHistory(
-            fb_chain,
-            get_message_history,
-            input_messages_key="input",
-            history_messages_key="history",
-        )
-        reply = fb_with_history.invoke({"input": req.message, "context": context}, config={"configurable": {"session_id": req.session_id}})
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="本地模型调用失败，请确认 Ollama 已启动并运行 setup-local-model.ps1 完成模型准备。") from exc
     return ChatResponse(session_id=req.session_id, reply=reply)
 
 @app.get("/api/chat/stream")
@@ -188,15 +149,23 @@ def chat_stream(session_id: str, message: str, request: Request):
 
     def event_generator():
         try:
+            yield ": connected\n\n"
+            has_content = False
             for chunk in chain.stream({"input": message, "context": context}, config={"configurable": {"session_id": session_id}}):
-                if chunk is None:
+                if not chunk:
                     continue
-                yield f"data: {str(chunk)}\n\n"
-            yield "event: done\ndata: [DONE]\n\n"
+                has_content = True
+                # Each line needs its own SSE data prefix, including blank lines.
+                yield "".join(f"data: {line}\n" for line in str(chunk).replace("\r\n", "\n").split("\n")) + "\n"
+            if has_content:
+                yield "event: done\ndata: [DONE]\n\n"
+            else:
+                yield "event: error\ndata: 模型未生成正文，请缩短问题后重试。\n\n"
         except Exception as e:
-            yield f"event: error\ndata: {str(e)}\n\n"
+            detail = "本地模型回复失败，请检查 Ollama 服务后重试。"
+            yield f"event: error\ndata: {detail}\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 class IngestRequest(BaseModel):
     content: str
@@ -240,4 +209,3 @@ def clear_history(session_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True}
-

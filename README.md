@@ -1,5 +1,30 @@
 # chatAI
 
+## 本地模型（RTX 5060 8GB）
+
+默认使用 Ollama 在本机运行 Qwen3 4B 量化模型，不再调用阿里云 API。
+模型下载约 2.5GB，实际显存还包括运行缓存；项目将上下文设为 4096 tokens，单次输出最多 2048 tokens，并关闭思考输出。聊天记忆、流式回复和 RAG 接口保留。
+
+1. 准备脚本会通过 winget 自动安装 Ollama 并启动服务；没有 winget 时手动安装 [Ollama Windows](https://ollama.com/download/windows)。首次安装和模型下载需要数 GB 空间。
+2. 安装 Python 3.12 和 Node.js。若已有 `backend/.venv` 但其 Python 已卸载，先把该目录重命名为 `.venv.old`，让启动脚本创建新环境。
+3. 在项目根目录运行：
+
+```powershell
+.\setup-local-model.ps1
+.\start.ps1 -Install
+```
+
+后续启动运行 `.\start.ps1`，访问 http://localhost:5173。
+首次准备模型需要联网下载，下载后本地聊天无需云端 API 密钥。
+
+`backend/Modelfile` 定义模型与上下文限制；修改后重新运行准备脚本。
+`backend/.env.example` 给出直接运行后端时的配置，复制为 `.env` 即可使用。
+旧 `OPENAI_*` 配置不再参与模型选择，现有密钥保留在本地文件中。
+启动脚本通过 `-Model` 和 `-BaseUrl` 覆盖本地模型及服务地址。
+运行 `ollama ps` 可查看 GPU 加载情况；实际性能以本机运行结果为准。
+模型不可用时普通聊天返回 HTTP 503，流式聊天返回 error 事件，不再生成示例回复。
+
+参考：[模型大小](https://ollama.com/library/qwen3:4b)、[Ollama 兼容接口与上下文设置](https://docs.ollama.com/api/openai-compatibility)。
 ## MCP Server (Weather Service)
 
 本项目包含一个 Model Context Protocol (MCP) 服务器，提供天气查询功能。

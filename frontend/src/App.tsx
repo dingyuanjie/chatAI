@@ -48,7 +48,7 @@ export default function App() {
   }, [sessionId]);
 
   const onSend = async () => {
-    if (!input.trim()) return;
+    if (!input.trim() || loading) return;
     const userMsg: ChatItem = { role: "human", content: input };
     setMessages((m) => [...m, userMsg]);
     setInput("");
@@ -73,7 +73,13 @@ export default function App() {
     es.addEventListener("error", (ev: any) => {
       setLoading(false);
       es.close();
-      antdMessage.error("流式连接错误");
+      const detail = ev.data || "连接中断，请确认本地模型和后端服务正常后重试。";
+      antdMessage.error(detail);
+      setMessages((m) => {
+        const last = m[m.length - 1];
+        if (!last || last.role !== "assistant") return m;
+        return [...m.slice(0, -1), { ...last, content: last.content + `\n\n${detail}` }];
+      });
     });
   };
 
@@ -150,6 +156,9 @@ export default function App() {
                   {item.role === "human" ? "我" : item.role === "assistant" ? "助手" : item.role}
                 </Typography.Text>
                 <div style={{ marginBottom: 0 }}>
+                  {isStreamingAssistant && !item.content && (
+                    <Typography.Text type="secondary">正在等待本地模型回复，首次加载可能需要一些时间…</Typography.Text>
+                  )}
                   <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
                     {mdText}
                   </ReactMarkdown>

@@ -7,6 +7,6 @@ langchain-community==0.3.5
 langchain-openai==0.2.4
 python-dotenv==1.0.1
 sqlalchemy==2.0.35
-dashscope==1.19.1
-mcp
+mcp==1.12.4
+sse-starlette==3.0.3
 httpx

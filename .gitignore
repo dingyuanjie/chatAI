@@ -42,3 +42,5 @@ frontend/.vite/
 # Temporary
 tmp/
 temp/
+
+!.env.example
