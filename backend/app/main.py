@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Optional, Dict, List
 import sqlite3
 import json
+import logging
+import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import SQLChatMessageHistory
 from langchain_openai import ChatOpenAI
 
+logger = logging.getLogger(__name__)
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -102,6 +105,7 @@ def build_chain():
         max_tokens=4096,
         timeout=180,
         max_retries=0,
+        http_client=httpx.Client(trust_env=False, timeout=180),
     )
     parser = StrOutputParser()
     chain = prompt | model | parser
@@ -136,6 +140,7 @@ def chat(req: ChatRequest) -> ChatResponse:
     try:
         reply = chain.invoke({"input": req.message, "context": context}, config={"configurable": {"session_id": req.session_id}})
     except Exception as exc:
+        logger.exception("Local chat completion failed")
         raise HTTPException(status_code=503, detail="本地模型调用失败，请确认 Ollama 已启动并运行 setup-local-model.ps1 完成模型准备。") from exc
     return ChatResponse(session_id=req.session_id, reply=reply)
 
@@ -162,6 +167,7 @@ def chat_stream(session_id: str, message: str, request: Request):
             else:
                 yield "event: error\ndata: 模型未生成正文，请缩短问题后重试。\n\n"
         except Exception as e:
+            logger.exception("Local streaming completion failed")
             detail = "本地模型回复失败，请检查 Ollama 服务后重试。"
             yield f"event: error\ndata: {detail}\n\n"
 
