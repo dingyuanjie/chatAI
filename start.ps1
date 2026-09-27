@@ -24,6 +24,15 @@ if ($Model -notin $models.data.id -and "${Model}:latest" -notin $models.data.id)
     & (Join-Path $PSScriptRoot 'setup-local-model.ps1')
   } else { throw "Model $Model is missing from $BaseUrl." }
 }
+$embeddingModel = 'qwen3-embedding:0.6b'
+$embeddingAvailable = $false
+try {
+  $localModels = Invoke-RestMethod 'http://127.0.0.1:11434/api/tags' -TimeoutSec 5
+  $embeddingAvailable = $embeddingModel -in $localModels.models.name
+} catch { }
+if (-not $embeddingAvailable) {
+  throw "The RAG embedding model is missing. Run .\setup-local-model.ps1 to download $embeddingModel, then restart."
+}
 $pythonExe = Join-Path $backend '.venv/Scripts/python.exe'
 if (!(Test-Path $pythonExe)) {
   if (Get-Command py -ErrorAction SilentlyContinue) { & py -3 -m venv (Join-Path $backend '.venv') }

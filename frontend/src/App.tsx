@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { Layout, Typography, Input, Button, List, Space, Segmented, message as antdMessage } from "antd";
-import { DeleteOutlined, SendOutlined } from "@ant-design/icons";
+import { Layout, Typography, Input, Button, List, Space, Segmented, message as antdMessage, Drawer, Upload, Popconfirm, Modal, Tag } from "antd";
+import { DeleteOutlined, SendOutlined, FileMarkdownOutlined, UploadOutlined, EyeOutlined } from "@ant-design/icons";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+
+type KnowledgeFile = { id: string; filename: string; created_at: string; chunks: number };
+type PreviewFile = { id: string; filename: string; content: string };
 
 type ChatItem = {
   role: "human" | "ai" | "assistant" | "system";
@@ -26,6 +29,9 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [kbText, setKbText] = useState("");
   const [kbLoading, setKbLoading] = useState(false);
+  const [knowledgeOpen, setKnowledgeOpen] = useState(false);
+  const [knowledgeFiles, setKnowledgeFiles] = useState<KnowledgeFile[]>([]);
+  const [previewFile, setPreviewFile] = useState<PreviewFile | null>(null);
 
   const normalizeMdPreview = (text: string, inStreaming: boolean) => {
     if (!inStreaming) return text;
@@ -46,6 +52,42 @@ export default function App() {
       }
     })();
   }, [sessionId]);
+
+  const refreshKnowledgeFiles = async () => {
+    try {
+      const { data } = await axios.get<KnowledgeFile[]>("/api/rag/files");
+      setKnowledgeFiles(data);
+    } catch (error: any) {
+      antdMessage.error(error.response?.data?.detail || "知识库文件读取失败");
+    }
+  };
+
+  useEffect(() => {
+    void refreshKnowledgeFiles();
+  }, []);
+
+  useEffect(() => {
+    if (knowledgeOpen) void refreshKnowledgeFiles();
+  }, [knowledgeOpen]);
+
+  const previewKnowledgeFile = async (fileId: string) => {
+    try {
+      const { data } = await axios.get<PreviewFile>(`/api/rag/files/${fileId}`);
+      setPreviewFile(data);
+    } catch (error: any) {
+      antdMessage.error(error.response?.data?.detail || "Markdown 预览加载失败");
+    }
+  };
+
+  const deleteKnowledgeFile = async (file: KnowledgeFile) => {
+    try {
+      await axios.delete(`/api/rag/files/${file.id}`);
+      setKnowledgeFiles((current) => current.filter((item) => item.id !== file.id));
+      antdMessage.success(`已删除 ${file.filename}`);
+    } catch (error: any) {
+      antdMessage.error(error.response?.data?.detail || "文件删除失败");
+    }
+  };
 
   const onSend = async () => {
     if (!input.trim() || loading) return;
@@ -107,6 +149,9 @@ export default function App() {
             带记忆的聊天机器人
           </Typography.Title>
           <Space>
+            <Button icon={<FileMarkdownOutlined />} onClick={() => setKnowledgeOpen(true)}>
+              知识库（{knowledgeFiles.length}）
+            </Button>
             <Button icon={<DeleteOutlined />} onClick={clearMemory} danger>
               清空记忆
             </Button>
@@ -187,6 +232,83 @@ export default function App() {
           </Button>
         </Space.Compact>
       </Layout.Content>
+      <Drawer
+        title="Markdown 知识库"
+        placement="right"
+        width={520}
+        open={knowledgeOpen}
+        onClose={() => setKnowledgeOpen(false)}
+      >
+        <Typography.Paragraph type="secondary">
+          上传 UTF-8 编码的 Markdown 文件，系统会在本机切分文本并使用 Qwen3 Embedding 生成向量。重新上传同名文件会更新其内容。
+        </Typography.Paragraph>
+        <Upload.Dragger
+          name="file"
+          accept=".md,text/markdown"
+          multiple
+          action="/api/rag/files"
+          showUploadList
+          beforeUpload={(file) => {
+            if (!file.name.toLowerCase().endsWith(".md")) {
+              antdMessage.error("仅支持 .md 文件");
+              return Upload.LIST_IGNORE;
+            }
+            if (file.size > 2 * 1024 * 1024) {
+              antdMessage.error("每个文件不能超过 2 MB");
+              return Upload.LIST_IGNORE;
+            }
+            return true;
+          }}
+          onChange={({ file }) => {
+            if (file.status === "done") {
+              antdMessage.success(`${file.name} 已加入本地向量知识库`);
+              void refreshKnowledgeFiles();
+            } else if (file.status === "error") {
+              const detail = file.response?.detail || `${file.name} 上传失败，请检查 Ollama 和本地向量模型`;
+              antdMessage.error(detail);
+            }
+          }}
+        >
+          <p className="ant-upload-drag-icon"><UploadOutlined /></p>
+          <p className="ant-upload-text">点击或拖放 .md 文件到这里</p>
+          <p className="ant-upload-hint">单个文件最大 2 MB；内容保存在本机。</p>
+        </Upload.Dragger>
+        <Typography.Title level={5} style={{ marginTop: 24 }}>已上传文件</Typography.Title>
+        <List
+          locale={{ emptyText: "还没有 Markdown 文件" }}
+          dataSource={knowledgeFiles}
+          renderItem={(file) => (
+            <List.Item
+              actions={[
+                <Button key="preview" type="text" icon={<EyeOutlined />} onClick={() => void previewKnowledgeFile(file.id)}>预览</Button>,
+                <Popconfirm key="delete" title={`删除 ${file.filename}？`} onConfirm={() => void deleteKnowledgeFile(file)}>
+                  <Button type="text" danger icon={<DeleteOutlined />}>删除</Button>
+                </Popconfirm>,
+              ]}
+            >
+              <List.Item.Meta
+                avatar={<FileMarkdownOutlined style={{ fontSize: 22 }} />}
+                title={file.filename}
+                description={<Space><Tag>{file.chunks} 个检索片段</Tag><Typography.Text type="secondary">{new Date(file.created_at).toLocaleString()}</Typography.Text></Space>}
+              />
+            </List.Item>
+          )}
+        />
+      </Drawer>
+      <Modal
+        title={previewFile?.filename || "Markdown 预览"}
+        open={Boolean(previewFile)}
+        onCancel={() => setPreviewFile(null)}
+        footer={null}
+        width={840}
+        destroyOnClose
+      >
+        <div style={{ maxHeight: "70vh", overflow: "auto", padding: "0 8px" }}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+            {previewFile?.content || ""}
+          </ReactMarkdown>
+        </div>
+      </Modal>
     </Layout>
   );
 }

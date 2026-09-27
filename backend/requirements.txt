@@ -10,3 +10,4 @@ sqlalchemy==2.0.35
 mcp==1.12.4
 sse-starlette==3.0.3
 httpx
+python-multipart==0.0.32

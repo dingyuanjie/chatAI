@@ -33,4 +33,6 @@ catch {
 if ($LASTEXITCODE -ne 0) { throw 'Model download failed.' }
 & $ollamaExe create chatai-local -f (Join-Path $PSScriptRoot 'backend/Modelfile')
 if ($LASTEXITCODE -ne 0) { throw 'Model creation failed.' }
-Write-Host 'Local model ready. Run .\start.ps1 -Install to start chatAI.'
+& $ollamaExe pull qwen3-embedding:0.6b
+if ($LASTEXITCODE -ne 0) { throw 'Embedding model download failed.' }
+Write-Host 'Local chat and embedding models ready. Run .\start.ps1 -Install to start chatAI.'

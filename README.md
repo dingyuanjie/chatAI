@@ -3,7 +3,7 @@
 ## 本地模型（RTX 5060 8GB）
 
 默认使用 Ollama 在本机运行 Qwen3 4B 量化模型，不再调用阿里云 API。
-模型下载约 2.5GB，实际显存还包括运行缓存；项目将上下文设为 4096 tokens，单次输出最多 2048 tokens，并关闭思考输出。聊天记忆、流式回复和 RAG 接口保留。
+模型下载约 2.5GB，实际显存还包括运行缓存；项目将上下文和单次输出上限都设为 4096 tokens。聊天记忆、流式回复和 RAG 接口保留。
 
 1. 准备脚本会通过 winget 自动安装 Ollama 并启动服务；没有 winget 时手动安装 [Ollama Windows](https://ollama.com/download/windows)。首次安装和模型下载需要数 GB 空间。
 2. 安装 Python 3.12 和 Node.js。若已有 `backend/.venv` 但其 Python 已卸载，先把该目录重命名为 `.venv.old`，让启动脚本创建新环境。
@@ -23,6 +23,14 @@
 启动脚本通过 `-Model` 和 `-BaseUrl` 覆盖本地模型及服务地址。
 运行 `ollama ps` 可查看 GPU 加载情况；实际性能以本机运行结果为准。
 模型不可用时普通聊天返回 HTTP 503，流式聊天返回 error 事件，不再生成示例回复。
+
+## 本地 Markdown 向量知识库
+
+点击聊天页右上方的“知识库”上传、预览或删除 Markdown 文件。支持 UTF-8 `.md` 文件，单个最大 2 MB；同名文件重新上传会更新内容。文件、切分片段和向量保存在本机 `backend/data/rag.sqlite`。
+
+本地嵌入使用阿里巴巴开源 Qwen3-Embedding 0.6B（约 639 MB），通过 Ollama `/api/embed` 批量生成向量。启动前运行 `.\setup-local-model.ps1` 下载嵌入模型；上传后聊天会用查询指令向量检索相关片段，回答中引用文件名。没有相关资料时，助手会说明知识库里没找到。
+
+参考：[Qwen3-Embedding 模型及大小](https://ollama.com/library/qwen3-embedding)、[Ollama Embeddings API](https://docs.ollama.com/api/embed)。
 
 参考：[模型大小](https://ollama.com/library/qwen3:4b)、[Ollama 兼容接口与上下文设置](https://docs.ollama.com/api/openai-compatibility)。
 ## MCP Server (Weather Service)
