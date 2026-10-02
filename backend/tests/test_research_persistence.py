@@ -206,12 +206,15 @@ class ResearchPersistenceTests(unittest.TestCase):
         )
         with patch.object(self.engine, "_start"):
             run = self.engine.create(payload, "owner-a")
+            self.engine._save_output(run["id"], 4, "synthesis", "综合失败", [], "failed")
+            with research.connection() as conn:
+                conn.execute("UPDATE research_runs SET current_round=4 WHERE id=?", (run["id"],))
             ResearchEngine._set_status(run["id"], "failed")
             resumed = self.engine.control(run["id"], "owner-a", "resume")
 
         self.assertEqual(resumed["status"], "running")
         self.assertTrue(resumed["continuous"])
-        self.assertEqual(resumed["current_round"], 0)
+        self.assertEqual(resumed["current_round"], 3)
 
     def test_non_registered_and_internal_agents_cannot_be_selected(self):
         for selected in (["physics", "not-registered"], ["physics", "synthesis"]):

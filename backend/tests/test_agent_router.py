@@ -32,6 +32,58 @@ class AgentRouterTests(unittest.TestCase):
         self.assertIn("physics", plan.agent_ids)
         self.assertIn("critic", plan.agent_ids)
 
+    def test_routes_quantum_and_entropy_questions_to_new_specialists(self):
+        quantum = self.router.route("量子纠缠是否支持结构生力理论？", research_depth="deep")
+        entropy = self.router.route("熵增与非平衡耗散结构如何导致层级涌现？", research_depth="deep")
+
+        self.assertIn("quantum", quantum.agent_ids)
+        self.assertIn("thermodynamics", entropy.agent_ids)
+
+    def test_routes_life_information_and_ai_questions_to_specialists(self):
+        life = self.router.route("生命起源与演化能否由统一结构解释？", research_depth="deep")
+        information = self.router.route("香农信息和物理熵有什么可检验关系？", research_depth="deep")
+        ai = self.router.route("Transformer 大模型是否涌现出新的计算机制？", research_depth="deep")
+
+        self.assertIn("biology", life.agent_ids)
+        self.assertIn("information", information.agent_ids)
+        self.assertIn("computation", ai.agent_ids)
+
+    def test_new_catalogue_specialists_are_auto_routable(self):
+        fixtures = {
+            "relativity": "gravitational wave spacetime curvature",
+            "particle_physics": "particle physics standard model",
+            "condensed_matter": "superconducting phase transition",
+            "astronomy": "telescope stellar observation",
+            "fluid_dynamics": "plasma turbulence",
+            "earth_science": "geology planetary habitability",
+            "chemistry": "catalysis chemical reaction",
+            "molecular_biology": "cell biology gene regulation",
+            "ecology": "climate system biodiversity",
+            "systems_biology": "systems biology metabolic network",
+            "network_science": "network dynamics graph network",
+            "dynamical_systems": "nonlinear dynamics bifurcation",
+            "control_theory": "control theory system identification",
+            "probability": "stochastic process probability theory",
+            "statistics": "Bayesian statistical inference",
+            "causal_inference": "causal graph counterfactual",
+            "logic": "formal logic logical consistency",
+            "topology": "topology differential geometry manifold",
+            "category_theory": "category theory functor morphism",
+            "philosophy_science": "philosophy of science scientific explanation",
+            "history_science": "history of science history of concepts",
+            "experimental_methods": "experimental design preregistration replication",
+            "metrology": "metrology uncertainty budget calibration",
+            "data_science": "computational reproducibility data leakage",
+            "robotics": "robotics embodied intelligence active perception",
+            "linguistics": "linguistics semantics language evolution",
+            "anthropology": "anthropology cultural evolution archaeology",
+            "economics": "game theory mechanism design",
+        }
+        for expected_agent, question in fixtures.items():
+            with self.subTest(agent=expected_agent):
+                plan = self.router.route(question, research_depth="deep")
+                self.assertIn(expected_agent, plan.agent_ids)
+
     def test_theory_attack_requires_critic_and_foundations(self):
         plan = self.router.route("请攻击结构生力理论。", "theory_attack", "deep")
 

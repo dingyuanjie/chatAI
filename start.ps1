@@ -58,10 +58,81 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed.' }
   }
 } finally { Pop-Location }
-foreach ($port in @($BackendPort, $FrontendPort)) {
-  if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
-    throw "Port $port is already in use. Stop that service or choose another port."
+$frontendNodeModules = Join-Path $frontend 'node_modules'
+$managedRoots = @{}
+$unmanagedListeners = @()
+
+foreach ($service in @(
+  @{ Name = 'backend'; Port = $BackendPort },
+  @{ Name = 'frontend'; Port = $FrontendPort }
+)) {
+  $listenerIds = Get-NetTCPConnection -LocalPort $service.Port -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess -Unique
+  foreach ($listenerId in $listenerIds) {
+    $chain = @()
+    $seen = @{}
+    $currentId = [int]$listenerId
+    while ($currentId -gt 0 -and -not $seen.ContainsKey($currentId)) {
+      $seen[$currentId] = $true
+      $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$currentId" -ErrorAction SilentlyContinue
+      if (-not $processInfo) { break }
+      $chain += $processInfo
+      $currentId = [int]$processInfo.ParentProcessId
+    }
+
+    $root = $null
+    if ($service.Name -eq 'backend') {
+      $root = $chain | Where-Object {
+        $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq [IO.Path]::GetFullPath($pythonExe)) -and
+        $_.CommandLine -match '(?i)-m\s+uvicorn\s+app\.main:app\b' -and
+        $_.CommandLine -match "(?i)--port\s+$($service.Port)(\s|$)"
+      } | Select-Object -First 1
+    } else {
+      $normalizedNodeModules = [IO.Path]::GetFullPath($frontendNodeModules).Replace('/', '\')
+      $listener = $chain | Select-Object -First 1
+      $listenerCommand = if ($listener) { ([string]$listener.CommandLine).Replace('/', '\') } else { '' }
+      $isProjectVite = $listenerCommand -like "*$normalizedNodeModules*" -and
+        $listenerCommand -match '(?i)vite[\\/]bin[\\/]vite\.js' -and
+        $listenerCommand -match "(?i)--port\s+$($service.Port)(\s|$)"
+      if ($isProjectVite) {
+        $root = $chain | Where-Object {
+          $_.CommandLine -match '(?i)npm(?:-cli\.js)?["'']?\s+run\s+dev' -and
+          $_.CommandLine -match "(?i)--port\s+$($service.Port)(\s|$)"
+        } | Select-Object -First 1
+        if (-not $root) { $root = $listener }
+      }
+    }
+
+    if ($root) {
+      $rootId = [string]$root.ProcessId
+      $managedRoots[$rootId] = $service
+    }
+    else { $unmanagedListeners += "port $($service.Port) (PID $listenerId)" }
   }
+}
+
+if ($unmanagedListeners.Count -gt 0) {
+  throw "Cannot safely restart the app because these ports are used by another service: $($unmanagedListeners -join ', '). Stop it or choose another port."
+}
+
+foreach ($processId in $managedRoots.Keys) {
+  Write-Host "Stopping existing chatAI $($managedRoots[$processId].Name) (PID $processId)..."
+  & taskkill.exe /PID ([int]$processId) /T /F | Out-Null
+  if ($LASTEXITCODE -ne 0 -and (Get-Process -Id ([int]$processId) -ErrorAction SilentlyContinue)) {
+    throw "Could not stop the existing chatAI process (PID $processId)."
+  }
+}
+
+foreach ($port in @($BackendPort, $FrontendPort)) {
+  $released = $false
+  for ($attempt = 0; $attempt -lt 15; $attempt++) {
+    if (-not (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+      $released = $true
+      break
+    }
+    Start-Sleep -Seconds 1
+  }
+  if (-not $released) { throw "Port $port is still in use after stopping the existing chatAI service." }
 }
 Start-Process -WindowStyle Hidden -WorkingDirectory $backend -FilePath $pythonExe -ArgumentList '-m','uvicorn','app.main:app','--host','127.0.0.1','--port',"$BackendPort" -RedirectStandardOutput (Join-Path $backend 'server.log') -RedirectStandardError (Join-Path $backend 'server-error.log')
 Start-Process -WindowStyle Hidden -WorkingDirectory $frontend -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-Command',"npm run dev -- --port $FrontendPort" -RedirectStandardOutput (Join-Path $frontend 'server.log') -RedirectStandardError (Join-Path $frontend 'server-error.log')

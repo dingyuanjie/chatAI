@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, ConfigProvider, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Select, Spin, Switch, Upload, message as toast, theme as antdTheme } from "antd";
 import {
-  ArrowDownOutlined, ArrowRightOutlined, BulbOutlined, CheckOutlined, DeleteOutlined, ExperimentOutlined, FileMarkdownOutlined,
+  ArrowDownOutlined, ArrowRightOutlined, BulbOutlined, CheckOutlined, DeleteOutlined, ExperimentOutlined, FileMarkdownOutlined, HistoryOutlined,
   LogoutOutlined, MenuOutlined, MessageOutlined, MoonOutlined, PaperClipOutlined, PlusOutlined, SunOutlined,
-  SendOutlined, UploadOutlined, UserOutlined,
+  SendOutlined, SettingOutlined, UploadOutlined, UserOutlined,
 } from "@ant-design/icons";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
@@ -17,10 +17,12 @@ axios.defaults.withCredentials = true;
 type User = { id: string; email: string; name: string };
 type ChatItem = { role: "human" | "ai" | "assistant" | "system"; content: string };
 type ChatSession = { session_id: string; title: string; updated_at: string };
-type KnowledgeFile = { id: string; filename: string; created_at: string; chunks: number };
+type KnowledgeFile = { id: string; filename: string; created_at: string; chunks: number; version?: number };
 type PreviewFile = { id: string; filename: string; content: string };
+type KnowledgeVersion = { version: number; content_hash: string; characters: number; created_at: string };
 type Locale = "zh" | "en";
 type Theme = "light" | "dark";
+type ModelSettings = { provider: "local" | "remote"; ollama_url: string; remote_base_url: string; local_chat_model: string; local_research_model: string; remote_chat_model: string; remote_research_model: string; embedding_model: string; api_key_configured: boolean };
 type ResearchAgent = { id: string; name: string; name_en: string; focus: string; focus_en: string; layer: string };
 type ResearchWorkflow = { id: string; name: string; name_en: string; budgets: Record<string, { max_active_agents: number; max_parallel_agents: number; max_debate_rounds: number; max_context_tokens: number }> };
 type ResearchOutput = { id: string; run_id: string; round_no: number; agent_id: string; agent_name: string; status: string; content: string; sources: { provider: string; title: string; url: string; snippet?: string }[] };
@@ -123,6 +125,7 @@ function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: s
   const [title, setTitle] = useState("");
   const [question, setQuestion] = useState("");
   const [selectedAgents, setSelectedAgents] = useState(["physics", "math", "complexity", "critic"]);
+  const [agentSearch, setAgentSearch] = useState("");
   const [autoRoute, setAutoRoute] = useState(true);
   const [workflowMode, setWorkflowMode] = useState("multidisciplinary");
   const [researchDepth, setResearchDepth] = useState("normal");
@@ -280,8 +283,9 @@ function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: s
         <label>{t("核心研究问题", "Core research question")}</label><Input.TextArea value={question} onChange={(event) => setQuestion(event.target.value)} autoSize={{ minRows: 4, maxRows: 8 }} placeholder={t("例如：宇宙是否可能源于简单底层原理，并通过层层涌现形成已知现象？请比较现有理论、寻找共同结构和反证。", "Could the universe emerge from simple foundations through successive layers? Compare existing theories, look for shared structures, and seek counterevidence.")} />
         <div className="run-settings"><div className="round-setting"><label>{t("协作模式", "Workflow")}</label><Select value={workflowMode} onChange={setWorkflowMode} options={workflows.map((workflow) => ({ value: workflow.id, label: locale === "zh" ? workflow.name : workflow.name_en }))} /></div><div className="round-setting"><label>{t("研究深度", "Research depth")}</label><Select value={researchDepth} onChange={(value) => { setResearchDepth(value); if (value === "fast") setSelectedAgents((current) => current.slice(0, 3)); }} options={[{ value: "fast", label: t("快速 · 最多 3 位", "Fast · up to 3") }, { value: "normal", label: t("标准 · 最多 7 位", "Normal · up to 7") }, { value: "deep", label: t("深度 · 最多 15 位", "Deep · up to 15") }]} /></div></div>
         <div className="continuous-setting route-toggle"><div><b>{t("自动选择相关专家", "Auto-select relevant experts")}</b><small>{t("按问题领域、协作模式和计算预算路由", "Route by topic, workflow, and compute budget")}</small></div><Switch checked={autoRoute} onChange={setAutoRoute} /></div>
-        {!autoRoute && <><div className="agent-selector-head"><div><label>{t("手动指定专家", "Expert overrides")}</label><small>{t("各专家共享本地模型，仅并行运行有限数量", "Roles share one local model and run within a bounded parallel limit")}</small></div><span>{selectedAgents.length}/{maxSelectableAgents}</span></div>
-        <div className="agent-picker">{agents.map((agent) => { const checked = selectedAgents.includes(agent.id); return <button type="button" key={agent.id} className={`agent-option ${checked ? "selected" : ""}`} onClick={() => setSelectedAgents((current) => checked ? current.filter((id) => id !== agent.id) : current.length < maxSelectableAgents ? [...current, agent.id] : current)}><span className="agent-check">{checked ? "✓" : "+"}</span><b>{locale === "zh" ? agent.name : agent.name_en}</b><small>{locale === "zh" ? agent.focus : agent.focus_en}</small></button>; })}</div></>}
+        {!autoRoute && <><div className="agent-selector-head"><div><label>{t("手动指定专家", "Expert overrides")}</label><small>{t("从 40 个学科角色中搜索；各角色共享本地模型，按预算限制运行数量", "Search 40 specialties; roles share the local model and are bounded by your compute budget")}</small></div><span>{selectedAgents.length}/{maxSelectableAgents}</span></div>
+        <Input allowClear value={agentSearch} onChange={(event) => setAgentSearch(event.target.value)} placeholder={t("搜索领域、角色或关键词", "Search disciplines, roles, or keywords")} />
+        <div className="agent-picker">{agents.filter((agent) => { const query = agentSearch.trim().toLocaleLowerCase(); return !query || `${agent.name} ${agent.name_en} ${agent.focus} ${agent.focus_en}`.toLocaleLowerCase().includes(query); }).map((agent) => { const checked = selectedAgents.includes(agent.id); return <button type="button" key={agent.id} className={`agent-option ${checked ? "selected" : ""}`} onClick={() => setSelectedAgents((current) => checked ? current.filter((id) => id !== agent.id) : current.length < maxSelectableAgents ? [...current, agent.id] : current)}><span className="agent-check">{checked ? "✓" : "+"}</span><b>{locale === "zh" ? agent.name : agent.name_en}</b><small>{locale === "zh" ? agent.focus : agent.focus_en}</small></button>; })}</div></>}
         <div className="run-settings"><div className="round-setting"><label>{t("迭代轮数", "Research rounds")}</label><InputNumber min={1} max={100} value={maxRounds} disabled={continuous} onChange={(value) => setMaxRounds(value)} /><span>{t("每轮都会保存检查点", "Checkpointed every round")}</span></div><div className="continuous-setting"><div><b>{t("持续运行", "Run continuously")}</b><small>{t("直到你手动暂停或停止", "Until you pause or stop it")}</small></div><Switch checked={continuous} onChange={setContinuous} /></div></div>
         <div className="research-disclaimer">{t("联网检索来源会附在每条输出中；本地知识库资料仅对当前登录账号开放。研究结果用于探索与讨论，不代表已证实的科学结论。", "Web sources are attached to each output; local library access is limited to this account. Results are exploratory and are not established scientific conclusions.")}</div>
       </div>
@@ -304,8 +308,17 @@ export default function App() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [knowledgeOpen, setKnowledgeOpen] = useState(false);
+  const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
+  const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
+  const [modelOptions, setModelOptions] = useState<{ local: string[]; remote: string[] }>({ local: [], remote: [] });
+  const [modelApiKey, setModelApiKey] = useState("");
+  const [clearModelApiKey, setClearModelApiKey] = useState(false);
+  const [modelBusy, setModelBusy] = useState(false);
   const [knowledgeFiles, setKnowledgeFiles] = useState<KnowledgeFile[]>([]);
   const [previewFile, setPreviewFile] = useState<PreviewFile | null>(null);
+  const [versionFile, setVersionFile] = useState<KnowledgeFile | null>(null);
+  const [versions, setVersions] = useState<KnowledgeVersion[]>([]);
+  const [versionDiff, setVersionDiff] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [bottomVisible, setBottomVisible] = useState(false);
   const [kbText, setKbText] = useState("");
@@ -337,6 +350,35 @@ export default function App() {
     const { data } = await axios.get<KnowledgeFile[]>("/api/rag/files");
     setKnowledgeFiles(data);
   }, []);
+  const loadModelSettings = useCallback(async () => {
+    const [{ data: settings }, { data: available }] = await Promise.all([axios.get<ModelSettings>("/api/settings/models"), axios.get("/api/settings/models/available")]);
+    setModelSettings(settings); setModelOptions({ local: available.local || [], remote: available.remote || [] });
+  }, []);
+  const openModelSettings = async () => {
+    setModelSettingsOpen(true); setModelBusy(true);
+    try { await loadModelSettings(); } catch (e: any) { toast.error(apiErrorText(e, locale, t("读取模型设置失败", "Could not load model settings"))); }
+    finally { setModelBusy(false); }
+  };
+  const saveModelSettings = async () => {
+    if (!modelSettings || modelBusy) return;
+    setModelBusy(true);
+    try {
+      const payload: Record<string, unknown> = { ...modelSettings, remote_api_key: modelApiKey || undefined, clear_api_key: clearModelApiKey };
+      const { data } = await axios.put("/api/settings/models", payload);
+      setModelSettings(data); setModelApiKey(""); setClearModelApiKey(false);
+      toast.success(data.reindexed_chunks ? t(`全局设置已保存，并重建 ${data.reindexed_chunks} 个向量片段`, `Global settings saved; re-indexed ${data.reindexed_chunks} chunks`) : t("全局模型设置已保存", "Global model settings saved"));
+      const { data: available } = await axios.get("/api/settings/models/available"); setModelOptions({ local: available.local || [], remote: available.remote || [] });
+    } catch (e: any) { toast.error(apiErrorText(e, locale, t("保存模型设置失败", "Could not save model settings"))); }
+    finally { setModelBusy(false); }
+  };
+  const testModelSettings = async () => {
+    if (!modelSettings) return;
+    setModelBusy(true);
+    try { await axios.post("/api/settings/models/test", { ...modelSettings, remote_api_key: modelApiKey || undefined, clear_api_key: clearModelApiKey }); toast.success(t("模型服务连接正常", "Model service connection is healthy")); }
+    catch (e: any) { toast.error(apiErrorText(e, locale, t("模型连接测试失败", "Model connection test failed"))); }
+    finally { setModelBusy(false); }
+  };
+  useEffect(() => { if (user) void loadModelSettings().catch(() => {}); }, [user, loadModelSettings]);
 
   const createSession = useCallback(async (select = true) => {
     const id = newId();
@@ -419,6 +461,16 @@ export default function App() {
     try { const { data } = await axios.get<PreviewFile>(`/api/rag/files/${fileId}`); setPreviewFile(data); }
     catch (e: any) { toast.error(apiErrorText(e, locale, t("Markdown 预览加载失败", "Could not load the Markdown preview"))); }
   };
+  const showVersions = async (file: KnowledgeFile) => {
+    try {
+      const { data } = await axios.get<KnowledgeVersion[]>(`/api/rag/files/${file.id}/versions`);
+      setVersionFile(file); setVersions(data); setVersionDiff("");
+      if (data.length > 1) {
+        const result = await axios.get(`/api/rag/files/${file.id}/compare`, { params: { from_version: data[1].version, to_version: data[0].version } });
+        setVersionDiff(result.data.diff || t("两个版本没有文本差异", "No text differences between these versions"));
+      }
+    } catch (e: any) { toast.error(apiErrorText(e, locale, t("加载版本记录失败", "Could not load version history"))); }
+  };
   const ingestText = async () => {
     const content = kbText.trim(); if (!content || kbLoading) return;
     setKbLoading(true);
@@ -443,13 +495,14 @@ export default function App() {
       <button className={`nav-item ${activeView === "chat" ? "selected" : ""}`} onClick={() => { setActiveView("chat"); setSidebarOpen(false); }}><MessageOutlined /><span>{t("普通对话", "Chat")}</span></button>
       <button className={`nav-item ${activeView === "research" ? "selected" : ""}`} onClick={() => { setActiveView("research"); setSidebarOpen(false); }}><ExperimentOutlined /><span>{t("科学探索", "Science exploration")}</span></button>
       <button className="nav-item" onClick={() => setKnowledgeOpen(true)}><FileMarkdownOutlined /><span>{t("理论资料库", "Theory library")}</span><b>{knowledgeFiles.length}</b></button>
+      <button className="nav-item" onClick={() => void openModelSettings()}><SettingOutlined /><span>{t("全局模型设置", "Global model settings")}</span></button>
       <div className="history-head"><span>{t("最近对话", "RECENT CHATS")}</span><button title={t("新建对话", "New chat")} onClick={() => void createSession()}><PlusOutlined /></button></div>
       <div className="session-list">
         {sessions.length === 0 && <div className="empty-history">{t("还没有对话记录", "No conversations yet")}</div>}
         {sessions.map((s) => <button key={s.session_id} className={`session-item ${s.session_id === sessionId ? "active" : ""}`} onClick={() => selectSession(s.session_id)}><MessageOutlined /><span>{locale === "en" && s.title === "新对话" ? "New chat" : locale === "en" && s.title === "历史对话" ? "Previous chat" : s.title || t("新对话", "New chat")}</span></button>)}
       </div>
       <div className="sidebar-bottom">
-        <div className="local-status"><span className="live-dot" /><span>{t("本地模型已连接", "Local model connected")}</span><span className="local-tag">LOCAL</span></div>
+        <div className="local-status"><span className="live-dot" /><span>{modelSettings?.provider === "remote" ? t("远端模型", "Remote model") : t("本地模型", "Local model")}</span><span className="local-tag">{modelSettings?.provider === "remote" ? "REMOTE" : "LOCAL"}</span></div>
         <div className="user-menu"><div className="avatar">{(user.name || "知").slice(0, 1).toUpperCase()}</div><div className="user-label"><b>{user.name}</b><span>{user.email}</span></div><button title={t("退出登录", "Sign out")} onClick={() => void logout()}><LogoutOutlined /></button></div>
       </div>
     </aside>
@@ -457,7 +510,7 @@ export default function App() {
       <header className="topbar">
         <button className="mobile-menu" onClick={() => setSidebarOpen(true)}><MenuOutlined /></button>
         <div className="breadcrumb"><span>{t("结构生力理论", "SVF Theory")}</span><span className="crumb-sep">/</span><b>{activeView === "research" ? t("科学探索", "Science exploration") : sessions.find((s) => s.session_id === sessionId)?.title || t("新对话", "New chat")}</b></div>
-      <div className="top-actions">{activeView === "chat" ? <><span className="model-pill"><span className="live-dot" /> Qwen3 · {t("本地运行", "Local")}</span><button className="top-icon" title={t("理论资料库", "Theory library")} onClick={() => setKnowledgeOpen(true)}><FileMarkdownOutlined /></button>{messages.length > 0 && <Popconfirm title={t("删除当前对话？", "Delete this chat?")} description={t("这条对话的历史记录会被清空。", "This chat history will be deleted.")} onConfirm={() => void clearCurrent()}><button className="top-icon" title={t("删除当前对话", "Delete chat")}><DeleteOutlined /></button></Popconfirm>}</> : <span className="research-model-pill"><ExperimentOutlined /> {t("多智能体任务独立运行", "Agents run independently")}</span>}<button className="appearance-button locale-button" onClick={() => setLocale(locale === "zh" ? "en" : "zh")} aria-label={t("切换为英文", "Switch to Chinese")}>{locale === "zh" ? "EN" : "中"}</button><button className="appearance-button" onClick={() => setTheme(theme === "light" ? "dark" : "light")} aria-label={t("切换主题", "Toggle theme")}>{theme === "light" ? <MoonOutlined /> : <SunOutlined />}</button><button className="top-icon logout-top" title={t("退出登录", "Sign out")} onClick={() => void logout()}><LogoutOutlined /></button></div>
+      <div className="top-actions">{activeView === "chat" ? <><span className="model-pill"><span className="live-dot" /> {modelSettings?.provider === "remote" ? `${modelSettings.remote_chat_model || "Remote"} · ${t("远端", "Remote")}` : `${modelSettings?.local_chat_model || "Ollama"} · ${t("本地", "Local")}`}</span><button className="top-icon" title={t("全局模型设置", "Global model settings")} onClick={() => void openModelSettings()}><SettingOutlined /></button><button className="top-icon" title={t("理论资料库", "Theory library")} onClick={() => setKnowledgeOpen(true)}><FileMarkdownOutlined /></button>{messages.length > 0 && <Popconfirm title={t("删除当前对话？", "Delete this chat?")} description={t("这条对话的历史记录会被清空。", "This chat history will be deleted.")} onConfirm={() => void clearCurrent()}><button className="top-icon" title={t("删除当前对话", "Delete chat")}><DeleteOutlined /></button></Popconfirm>}</> : <span className="research-model-pill"><ExperimentOutlined /> {t("多智能体任务独立运行", "Agents run independently")}</span>}<button className="appearance-button locale-button" onClick={() => setLocale(locale === "zh" ? "en" : "zh")} aria-label={t("切换为英文", "Switch to Chinese")}>{locale === "zh" ? "EN" : "中"}</button><button className="appearance-button" onClick={() => setTheme(theme === "light" ? "dark" : "light")} aria-label={t("切换主题", "Toggle theme")}>{theme === "light" ? <MoonOutlined /> : <SunOutlined />}</button><button className="top-icon logout-top" title={t("退出登录", "Sign out")} onClick={() => void logout()}><LogoutOutlined /></button></div>
       </header>
       {activeView === "research" ? <ScienceWorkspace locale={locale} t={t} /> : <>
       <section className="chat-scroll" onScroll={(e) => { const el = e.currentTarget; setBottomVisible(el.scrollHeight - el.scrollTop - el.clientHeight > 160); }}>
@@ -500,6 +553,28 @@ export default function App() {
       </>}
     </main>
 
+    <Drawer title={<div className="drawer-title"><span className="drawer-icon"><SettingOutlined /></span><span>{t("全局模型设置", "Global model settings")}<small>{t("聊天、科研与知识库共用", "Shared by chat, research, and knowledge search")}</small></span></div>} placement="right" width={520} open={modelSettingsOpen} onClose={() => setModelSettingsOpen(false)} className="knowledge-drawer model-settings-drawer">
+      {!modelSettings ? <div style={{ padding: 30, textAlign: "center" }}><Spin /></div> : <>
+        <div className="knowledge-intro">{t("这些设置对整个网站和所有账号生效。向量模型更改后，会自动重建所有用户的知识库索引。", "These settings apply to the whole site and every account. Changing the embedding model rebuilds every user's knowledge index.")}</div>
+        <Form layout="vertical" requiredMark={false}>
+          <Form.Item label={t("聊天与科研模型来源", "Chat and research provider")}><Select value={modelSettings.provider} onChange={(provider: "local" | "remote") => setModelSettings({ ...modelSettings, provider })} options={[{ value: "local", label: t("本地 Ollama 模型", "Local Ollama models") }, { value: "remote", label: t("远端 OpenAI 兼容 API", "Remote OpenAI-compatible API") }]} /></Form.Item>
+          {modelSettings.provider === "local" ? <>
+            <Form.Item label={t("Ollama 地址", "Ollama URL")}><Input value={modelSettings.ollama_url} placeholder="http://127.0.0.1:11434" onChange={(e) => setModelSettings({ ...modelSettings, ollama_url: e.target.value })} /></Form.Item>
+            <Form.Item label={t("聊天模型", "Chat model")}><Select showSearch value={modelSettings.local_chat_model} onChange={(local_chat_model) => setModelSettings({ ...modelSettings, local_chat_model })} options={[...new Set([...modelOptions.local, modelSettings.local_chat_model])].filter(Boolean).map((value) => ({ value, label: value }))} /></Form.Item>
+            <Form.Item label={t("科研模型", "Research model")}><Select showSearch value={modelSettings.local_research_model} onChange={(local_research_model) => setModelSettings({ ...modelSettings, local_research_model })} options={[...new Set([...modelOptions.local, modelSettings.local_research_model])].filter(Boolean).map((value) => ({ value, label: value }))} /></Form.Item>
+          </> : <>
+            <Form.Item label={t("远端 API 地址", "Remote API base URL")}><Input value={modelSettings.remote_base_url} placeholder="https://api.example.com/v1" onChange={(e) => setModelSettings({ ...modelSettings, remote_base_url: e.target.value })} /></Form.Item>
+            <Form.Item label={t("API 密钥", "API key")}><Input.Password value={modelApiKey} placeholder={modelSettings.api_key_configured ? t("已配置；留空以保留当前密钥", "Configured; leave blank to keep current key") : t("输入 API 密钥（可选）", "Enter API key (optional)")} onChange={(e) => { setModelApiKey(e.target.value); setClearModelApiKey(false); }} />{modelSettings.api_key_configured && <Button type="link" danger onClick={() => { setClearModelApiKey(true); setModelApiKey(""); }}>{clearModelApiKey ? t("保存时将清除密钥", "Key will be cleared on save") : t("清除已保存密钥", "Clear saved key")}</Button>}</Form.Item>
+            <Form.Item label={t("聊天模型名称", "Chat model ID")}><Input value={modelSettings.remote_chat_model} placeholder={t("例如 gpt-4o-mini", "e.g. gpt-4o-mini")} onChange={(e) => setModelSettings({ ...modelSettings, remote_chat_model: e.target.value })} /></Form.Item>
+            <Form.Item label={t("科研模型名称（可留空以共用聊天模型）", "Research model ID (optional; defaults to chat model)")}><Input value={modelSettings.remote_research_model} onChange={(e) => setModelSettings({ ...modelSettings, remote_research_model: e.target.value })} /></Form.Item>
+            {modelOptions.remote.length > 0 && <div className="knowledge-intro">{t("服务端模型列表", "Models exposed by this service")}: {modelOptions.remote.join(", ")}</div>}
+          </>}
+          <Form.Item label={t("本地向量模型（Ollama）", "Local embedding model (Ollama)")}><Select showSearch value={modelSettings.embedding_model} onChange={(embedding_model) => setModelSettings({ ...modelSettings, embedding_model })} options={[...new Set([...modelOptions.local, modelSettings.embedding_model])].filter(Boolean).map((value) => ({ value, label: value }))} /></Form.Item>
+          <div className="model-settings-note">{t("科研联网检索不变；选择远端后，聊天与科研智能体会使用远端服务。知识库向量始终由此处指定的本地 Ollama 模型生成。", "Web search remains unchanged. Remote mode routes chat and research agents to the remote service. Knowledge-base embeddings always use the selected local Ollama model.")}</div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}><Button loading={modelBusy} onClick={() => void testModelSettings()}>{t("测试连接", "Test connection")}</Button><Button type="primary" loading={modelBusy} onClick={() => void saveModelSettings()}>{t("保存全局设置", "Save global settings")}</Button></div>
+        </Form>
+      </>}
+    </Drawer>
     <Drawer title={<div className="drawer-title"><span className="drawer-icon"><FileMarkdownOutlined /></span><span>{t("我的知识库", "My knowledge base")}<small>{t("你的本地资料，随时可检索", "Your local notes, ready to search")}</small></span></div>} placement="right" width={490} open={knowledgeOpen} onClose={() => setKnowledgeOpen(false)} className="knowledge-drawer">
       <div className="knowledge-intro">{t("上传结构生力理论相关的 Markdown 文档，整理为可检索的理论资料。文件与向量保存在本机。", "Upload Markdown source materials about Structural Vital Force Theory. Files and embeddings stay on this device.")}</div>
       <Upload.Dragger className="knowledge-uploader" name="file" accept=".md,text/markdown" multiple action="/api/rag/files" showUploadList beforeUpload={(file) => {
@@ -511,11 +586,15 @@ export default function App() {
       </Upload.Dragger>
       <div className="manual-entry"><div><b>{t("添加理论资料", "Add theory material")}</b><span>{t("粘贴结构生力理论相关内容", "Paste content related to the theory")}</span></div><Input.TextArea value={kbText} onChange={(e) => setKbText(e.target.value)} placeholder={t("粘贴要整理或检索的理论内容…", "Paste theory content to organize or search…")} autoSize={{ minRows: 2, maxRows: 4 }} /><Button type="primary" loading={kbLoading} disabled={!kbText.trim()} onClick={() => void ingestText()}>{t("加入资料库", "Add to library")} <ArrowRightOutlined /></Button></div>
       <div className="files-heading"><span>{t("已收录的资料", "Your files")}</span><span>{t(`${knowledgeFiles.length} 个文件`, `${knowledgeFiles.length} files`)}</span></div>
-      <div className="file-list">{knowledgeFiles.length === 0 ? <div className="empty-files"><FileMarkdownOutlined /><b>{t("资料库还是空的", "No materials yet")}</b><span>{t("上传理论相关 Markdown，开始建立资料库", "Upload theory-related Markdown to build your library")}</span></div> : knowledgeFiles.map((file) => <div className="file-card" key={file.id}><div className="file-type"><FileMarkdownOutlined /></div><div className="file-info"><b>{file.filename}</b><span>{t(`${file.chunks} 个检索片段`, `${file.chunks} chunks`)} · {new Date(file.created_at).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US")}</span></div><button title={t("预览", "Preview")} onClick={() => void previewKnowledgeFile(file.id)}><ArrowRightOutlined /></button><Popconfirm title={t(`删除 ${file.filename}？`, `Delete ${file.filename}?`)} description={t("相关向量片段也会被移除。", "Its searchable chunks will also be removed.")} onConfirm={() => void deleteKnowledgeFile(file)}><button className="file-delete" title={t("删除", "Delete")}><DeleteOutlined /></button></Popconfirm></div>)}</div>
-      <div className="embedding-note"><span className="live-dot" /> {t("由 Qwen3 Embedding 本地向量模型提供检索", "Search powered by local Qwen3 Embedding")}</div>
+      <div className="file-list">{knowledgeFiles.length === 0 ? <div className="empty-files"><FileMarkdownOutlined /><b>{t("资料库还是空的", "No materials yet")}</b><span>{t("上传理论相关 Markdown，开始建立资料库", "Upload theory-related Markdown to build your library")}</span></div> : knowledgeFiles.map((file) => <div className="file-card" key={file.id}><div className="file-type"><FileMarkdownOutlined /></div><div className="file-info"><b>{file.filename}</b><span>{t(`${file.chunks} 个检索片段`, `${file.chunks} chunks`)} · v{file.version || 1} · {new Date(file.created_at).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US")}</span></div><button title={t("版本历史", "Version history")} onClick={() => void showVersions(file)}><HistoryOutlined /></button><button title={t("预览", "Preview")} onClick={() => void previewKnowledgeFile(file.id)}><ArrowRightOutlined /></button><Popconfirm title={t(`删除 ${file.filename}？`, `Delete ${file.filename}?`)} description={t("相关向量片段也会被移除。", "Its searchable chunks will also be removed.")} onConfirm={() => void deleteKnowledgeFile(file)}><button className="file-delete" title={t("删除", "Delete")}><DeleteOutlined /></button></Popconfirm></div>)}</div>
+      <div className="embedding-note"><span className="live-dot" /> {t(`由 ${modelSettings?.embedding_model || "本地向量模型"} 提供检索`, `Search powered by ${modelSettings?.embedding_model || "local embeddings"}`)}</div>
     </Drawer>
     <Modal title={<div className="preview-heading"><FileMarkdownOutlined /> {previewFile?.filename || t("Markdown 预览", "Markdown preview")}</div>} open={Boolean(previewFile)} onCancel={() => setPreviewFile(null)} footer={null} width={780} destroyOnClose>
       <div className="markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{previewFile?.content || ""}</ReactMarkdown></div>
+    </Modal>
+    <Modal title={<div className="preview-heading"><HistoryOutlined /> {versionFile?.filename} · {t("版本历史", "Version history")}</div>} open={Boolean(versionFile)} onCancel={() => setVersionFile(null)} footer={null} width={780} destroyOnClose>
+      <div style={{ display: "grid", gap: 10, marginBottom: 16 }}>{versions.map((v) => <div key={v.version} className="file-card"><div className="file-info"><b>v{v.version} {v.version === (versionFile?.version || 1) ? `· ${t("当前版本", "Current")}` : ""}</b><span>{new Date(v.created_at).toLocaleString(locale === "zh" ? "zh-CN" : "en-US")} · {v.characters} {t("字符", "characters")} · SHA-256 {v.content_hash.slice(0, 12)}</span></div><button title={t("查看此版本", "Preview this version")} onClick={async () => { try { const { data } = await axios.get(`/api/rag/files/${versionFile!.id}/versions/${v.version}`); setPreviewFile({ id: versionFile!.id, filename: `${versionFile!.filename} · v${v.version}`, content: data.content }); } catch { toast.error(t("版本读取失败", "Could not load this version")); } }}><ArrowRightOutlined /></button></div>)}</div>
+      {versions.length > 1 && <><b>{t("最近版本差异", "Latest version changes")}</b><pre style={{ whiteSpace: "pre-wrap", overflow: "auto", maxHeight: 360, padding: 14, borderRadius: 8, background: "var(--surface-muted, #f5f5f2)" }}>{versionDiff}</pre></>}
     </Modal>
   </div></ConfigProvider>;
 }

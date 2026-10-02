@@ -21,17 +21,17 @@ WORKFLOWS: Dict[str, WorkflowProfile] = {
     "expert_consultation": WorkflowProfile(
         "expert_consultation", "专家咨询", "Expert consultation",
         "聚焦回答一个明确的专业问题，给出关键依据与主要限制，避免扩展无关分支。",
-        ("physics", "math", "complexity", "cosmology", "foundations"), (),
+        ("physics", "math", "complexity", "cosmology", "foundations", "quantum", "information", "thermodynamics"), (),
     ),
     "multidisciplinary": WorkflowProfile(
         "multidisciplinary", "多学科研究", "Multidisciplinary research",
         "从多个相关领域独立分析，再比较一致发现、真实分歧、证据强弱和未解问题。",
-        ("physics", "math", "complexity", "cosmology", "foundations", "critic"), ("critic",),
+        ("physics", "math", "complexity", "cosmology", "foundations", "information", "thermodynamics", "biology", "critic"), ("critic",),
     ),
     "theory_attack": WorkflowProfile(
         "theory_attack", "理论攻击", "Theory attack",
         "优先尝试反驳待审主张：查找反例、替代理论、逻辑缺口和明确证伪条件。不得替理论辩护。",
-        ("critic", "foundations", "math", "physics", "complexity", "cosmology"), ("critic", "foundations"),
+        ("critic", "foundations", "math", "physics", "complexity", "cosmology", "information"), ("critic", "foundations"),
     ),
     "mathematical_modeling": WorkflowProfile(
         "mathematical_modeling", "数学建模", "Mathematical modeling",
@@ -46,7 +46,7 @@ WORKFLOWS: Dict[str, WorkflowProfile] = {
     "open_exploration": WorkflowProfile(
         "open_exploration", "开放探索", "Open exploration",
         "探索潜在联系，但把类比与机制等价分开；寻找新假设同时主动记录反例和证据限制。",
-        ("physics", "math", "complexity", "cosmology", "foundations", "critic"), ("critic",),
+        ("physics", "math", "complexity", "cosmology", "foundations", "quantum", "thermodynamics", "information", "biology", "critic"), ("critic",),
     ),
     "peer_review": WorkflowProfile(
         "peer_review", "同行评审", "Peer review",

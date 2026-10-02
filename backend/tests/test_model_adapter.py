@@ -10,6 +10,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
     @patch("app.providers.openai_compatible.httpx.post")
     def test_uses_configured_model_and_profile_generation_limits(self, post):
         response = Mock()
+        response.status_code = 200
         response.json.return_value = {
             "choices": [{"finish_reason": "stop", "message": {"content": "分析结果"}}]
         }
@@ -27,6 +28,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
     @patch("app.providers.openai_compatible.httpx.post")
     def test_explains_empty_output_after_generation_limit(self, post):
         response = Mock()
+        response.status_code = 200
         response.json.return_value = {
             "choices": [{"finish_reason": "length", "message": {"content": ""}}]
         }
@@ -35,16 +37,39 @@ class ResearchModelAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "耗尽了生成长度"):
             ResearchEngine._call_model("system", "question")
 
-    @patch.dict(os.environ, {"RESEARCH_BASE_URL": "http://model.local/v1", "RESEARCH_MODEL": "custom", "RESEARCH_API_KEY": "secret"})
     @patch("app.providers.openai_compatible.httpx.post")
     def test_supports_configured_openai_compatible_endpoint(self, post):
         response = Mock()
+        response.status_code = 200
         response.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
         post.return_value = response
 
-        self.assertEqual(ResearchEngine._call_model("s", "p"), "ok")
+        with patch("app.providers.openai_compatible.model_settings.get", return_value={
+            "provider": "remote", "remote_base_url": "http://model.local/v1", "remote_research_model": "custom",
+            "remote_chat_model": "chat", "remote_api_key": "secret",
+        }):
+            self.assertEqual(ResearchEngine._call_model("s", "p"), "ok")
         self.assertEqual(post.call_args.args[0], "http://model.local/v1/chat/completions")
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer secret")
+
+    @patch("app.providers.openai_compatible.httpx.post")
+    def test_explains_context_window_rejection(self, post):
+        response = Mock()
+        response.status_code = 400
+        response.text = '{"error":{"message":"prompt exceeds the available context length"}}'
+        response.json.return_value = {"error": {"message": "prompt exceeds the available context length"}}
+        post.return_value = response
+
+        with self.assertRaisesRegex(RuntimeError, "上下文窗口不足"):
+            ResearchEngine._call_model("system", "long prompt")
+
+    def test_synthesis_prompt_is_bounded_for_small_local_context(self):
+        outputs = [f"专家{i}：\n" + ("[finding] 支持该推论但仍需检验 [W1]。" * 100) for i in range(6)]
+        prompt = ResearchEngine._synthesis_prompt("统一底层原理", "结构和涌现" * 100, 12, outputs)
+
+        self.assertLessEqual(len(prompt), 2100)
+        self.assertIn("第 12 轮", prompt)
+        self.assertIn("专家1", prompt)
 
 
 if __name__ == "__main__":

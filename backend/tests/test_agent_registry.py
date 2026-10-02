@@ -13,12 +13,17 @@ PROFILES = Path(__file__).parents[1] / "app" / "agents" / "profiles"
 class AgentRegistryTests(unittest.TestCase):
     def test_loads_existing_experts_and_keeps_synthesis_internal(self):
         registry = AgentRegistry.from_directory(PROFILES)
+        added_ids = {
+            "relativity", "particle_physics", "condensed_matter", "astronomy", "fluid_dynamics", "earth_science",
+            "chemistry", "molecular_biology", "ecology", "systems_biology", "network_science", "dynamical_systems",
+            "control_theory", "probability", "statistics", "causal_inference", "logic", "topology", "category_theory",
+            "philosophy_science", "history_science", "experimental_methods", "metrology", "data_science", "robotics",
+            "linguistics", "anthropology", "economics",
+        }
 
-        self.assertEqual(
-            {agent.id for agent in registry.list_agents()},
-            {"physics", "math", "complexity", "cosmology", "foundations", "critic"},
-        )
-        self.assertEqual(len(registry.list_agents(include_internal=True)), 9)
+        self.assertEqual(len(registry.list_agents()), 40)
+        self.assertTrue(added_ids.issubset({agent.id for agent in registry.list_agents()}))
+        self.assertEqual(len(registry.list_agents(include_internal=True)), 43)
         self.assertFalse(registry.get_agent("synthesis").selectable)
 
     def test_domain_and_capability_lookup_are_case_insensitive(self):

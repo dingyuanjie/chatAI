@@ -398,13 +398,22 @@ class ResearchEngine:
         if not self._get_row(run_id, owner_id):
             raise HTTPException(404, "探索任务不存在")
         with connection() as conn:
-            row = conn.execute("SELECT status FROM research_runs WHERE id=?", (run_id,)).fetchone()
+            row = conn.execute("SELECT status,current_round FROM research_runs WHERE id=?", (run_id,)).fetchone()
             status = row["status"]
             if action == "pause" and status in ("running", "queued"):
                 conn.execute("UPDATE research_runs SET status='pause_requested', updated_at=? WHERE id=?", (utc_now(), run_id))
             elif action == "stop" and status in ("running", "queued", "pause_requested"):
                 conn.execute("UPDATE research_runs SET status='cancel_requested', updated_at=? WHERE id=?", (utc_now(), run_id))
             elif action == "resume" and status in ("paused", "failed", "cancelled"):
+                # A failed synthesis is stored after current_round advances.
+                # Roll that checkpoint back one round so resume retries the
+                # saved synthesis instead of silently skipping it.
+                failed_synthesis = conn.execute(
+                    "SELECT 1 FROM research_outputs WHERE run_id=? AND round_no=? AND agent_id='synthesis' AND status='failed'",
+                    (run_id, row["current_round"]),
+                ).fetchone()
+                if failed_synthesis and row["current_round"] > 0:
+                    conn.execute("UPDATE research_runs SET current_round=current_round-1 WHERE id=?", (run_id,))
                 conn.execute("UPDATE research_runs SET status='running', error='', updated_at=? WHERE id=?", (utc_now(), run_id))
                 conn.commit()
                 self._start(run_id)
@@ -572,6 +581,28 @@ class ResearchEngine:
                 f"此前研究进展：\n{previous or '这是第一轮，暂无此前进展。'}\n\n"
                 "请从你的专业角度独立分析，提出 3 到 5 条关键发现、支持证据和反证/限制，并提出一个下一轮值得追问的问题。尽量具体、可检验。")
 
+    @staticmethod
+    def _synthesis_prompt(title: str, question: str, round_no: int, completed: List[str], review: str = "") -> str:
+        # chatai-local is built with num_ctx=4096. Keep synthesis input bounded
+        # so the prompt, system message, and generation budget fit that window.
+        question = question.strip()
+        if len(question) > 700:
+            question = question[:520] + "……（问题中段略）……" + question[-150:]
+        header = f"研究主题：{title[:160]}\n核心问题：{question}\n第 {round_no} 轮多学科智能体成果：\n"
+        footer = "\n\n请综合一致结论、真实分歧、证据强弱、反例和下一轮研究问题。给出清晰摘要；不得把猜想包装成结论。引用沿用智能体使用的 [W#]/[K#] 来源编号。"
+        budget = max(0, 2100 - len(header) - len(footer) - len(review) - 8)
+        if completed:
+            labels = [item.split("：", 1)[0][:80] + "：\n" for item in completed]
+            per_item = max(0, (budget - sum(map(len, labels)) - 2 * (len(labels) - 1)) // len(labels))
+            excerpts = []
+            for item, label in zip(completed, labels):
+                body = item.split("\n", 1)[1] if "\n" in item else item
+                excerpts.append(label + body[:per_item])
+            findings = "\n\n".join(excerpts)
+        else:
+            findings = "本轮没有智能体输出。"
+        return header + findings + footer + review
+
     def _work(self, run_id: str):
         try:
             initial = self._state(run_id)
@@ -708,11 +739,9 @@ class ResearchEngine:
                             else:
                                 completed.append(f"研究员回应：\n{response_output['content'][:1200]}")
                     synthesis = self._existing_output(run_id, round_no, "synthesis")
-                    if not synthesis:
-                        synthesis_prompt = (f"研究主题：{run['title']}\n核心问题：{run['question']}\n第 {round_no} 轮多学科智能体成果：\n"
-                                            + ("\n\n".join(completed) or "本轮没有智能体成功返回成果。")
-                                            + "\n\n请综合一致结论、真实分歧、证据强弱、反例和下一轮研究问题。给出清晰摘要；不得把猜想包装成结论。引用沿用智能体使用的 [W#]/[K#] 来源编号。"
-                                            + ("这是有限轮次的质疑审查，请充当研究评审：逐项判断主要批评是已回应、部分回应还是未解决；指出回应是否有可追溯来源。评审提出质疑不等于质疑已成立，研究员回应也不等于主张已证实。若现有资料无法判断，请保留为未解决问题。" if run["workflow_mode"] in debate_modes else ""))
+                    if not synthesis or synthesis["status"] != "completed":
+                        review_instruction = ("这是有限轮次的质疑审查，请充当研究评审：逐项判断主要批评是已回应、部分回应还是未解决；指出回应是否有可追溯来源。评审提出质疑不等于质疑已成立，研究员回应也不等于主张已证实。若现有资料无法判断，请保留为未解决问题。" if run["workflow_mode"] in debate_modes else "")
+                        synthesis_prompt = self._synthesis_prompt(run["title"], run["question"], round_no, completed, review_instruction)
                         try:
                             synthesis_system = (AGENTS["synthesis"].system_prompt + "使用核心问题的语言作答。"
                                 "评审中逐条标记接受、部分接受或未解决；不得用投票代替证据判断。"
@@ -721,7 +750,7 @@ class ResearchEngine:
                                 "- [hypothesis] 未验证假设；- [prediction] 可检验预测；"
                                 "- [counterevidence] 反例；- [limitation] 未知或限制。")
                             synthesis_agent = AGENTS["synthesis"]
-                            summary = self._call_model(synthesis_system, synthesis_prompt, synthesis_agent.temperature, synthesis_agent.max_tokens)
+                            summary = self._call_model(synthesis_system, synthesis_prompt, synthesis_agent.temperature, min(synthesis_agent.max_tokens, 800))
                             self._save_output(run_id, round_no, "synthesis", summary, source_records)
                         except Exception as exc:
                             summary = f"本轮综合失败：{str(exc)[:500]}"
