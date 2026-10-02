@@ -6,9 +6,15 @@ import json
 import logging
 import httpx
 import math
+import hashlib
+import hmac
+import secrets
+import re
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -39,6 +45,9 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SQLITE_URL = f"sqlite:///{(DATA_DIR / 'memory.sqlite').as_posix()}"
 RAG_DB_PATH = DATA_DIR / "rag.sqlite"
+AUTH_DB_PATH = DATA_DIR / "auth.sqlite"
+AUTH_COOKIE = "chatai_session"
+AUTH_MAX_AGE = 60 * 60 * 24 * 30
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE") or "http://127.0.0.1:11434"
@@ -62,9 +71,11 @@ class RAGStore:
             cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(content, metadata)")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_files (
                 id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                owner_id TEXT NOT NULL,
+                filename TEXT NOT NULL COLLATE NOCASE,
                 content TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                UNIQUE(owner_id, filename)
             )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_chunks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +84,24 @@ class RAGStore:
                 content TEXT NOT NULL,
                 embedding TEXT NOT NULL
             )""")
+            columns = {row[1] for row in cur.execute("PRAGMA table_info(knowledge_files)").fetchall()}
+            if "owner_id" not in columns:
+                cur.execute("ALTER TABLE knowledge_chunks RENAME TO knowledge_chunks_legacy")
+                cur.execute("ALTER TABLE knowledge_files RENAME TO knowledge_files_legacy")
+                cur.execute("""CREATE TABLE knowledge_files (
+                    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+                    filename TEXT NOT NULL COLLATE NOCASE, content TEXT NOT NULL,
+                    created_at TEXT NOT NULL, UNIQUE(owner_id, filename)
+                )""")
+                cur.execute("""CREATE TABLE knowledge_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id TEXT NOT NULL REFERENCES knowledge_files(id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding TEXT NOT NULL
+                )""")
+                cur.execute("INSERT INTO knowledge_files(id,owner_id,filename,content,created_at) SELECT id,'legacy',filename,content,created_at FROM knowledge_files_legacy")
+                cur.execute("INSERT INTO knowledge_chunks(file_id,chunk_index,content,embedding) SELECT file_id,chunk_index,content,embedding FROM knowledge_chunks_legacy")
+                cur.execute("DROP TABLE knowledge_chunks_legacy")
+                cur.execute("DROP TABLE knowledge_files_legacy")
             conn.commit()
         finally:
             conn.close()
@@ -115,21 +144,25 @@ class RAGStore:
             logger.exception("Local embedding request failed")
             raise HTTPException(503, f"本地向量模型不可用，请运行 ollama pull {EMBEDDING_MODEL}。") from exc
 
-    def list_files(self) -> List[Dict]:
+    def list_files(self, owner_id: str) -> List[Dict]:
         with self._conn() as conn:
             rows = conn.execute("""SELECT f.id, f.filename, f.created_at, COUNT(c.id)
                 FROM knowledge_files f LEFT JOIN knowledge_chunks c ON c.file_id=f.id
-                GROUP BY f.id ORDER BY f.created_at DESC""").fetchall()
+                WHERE f.owner_id=? GROUP BY f.id ORDER BY f.created_at DESC""", (owner_id,)).fetchall()
         return [{"id": row[0], "filename": row[1], "created_at": row[2], "chunks": row[3]} for row in rows]
 
-    def get_file(self, file_id: str) -> Optional[Dict]:
+    def claim_legacy_files(self, owner_id: str):
+        with self._conn() as conn:
+            conn.execute("UPDATE knowledge_files SET owner_id=? WHERE owner_id='legacy'", (owner_id,))
+
+    def get_file(self, file_id: str, owner_id: str) -> Optional[Dict]:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT id, filename, content, created_at FROM knowledge_files WHERE id=?", (file_id,)
+                "SELECT id, filename, content, created_at FROM knowledge_files WHERE id=? AND owner_id=?", (file_id, owner_id)
             ).fetchone()
         return {"id": row[0], "filename": row[1], "content": row[2], "created_at": row[3]} if row else None
 
-    def upsert_file(self, filename: str, content: str) -> Dict:
+    def upsert_file(self, filename: str, content: str, owner_id: str) -> Dict:
         chunks = self._split(content)
         vectors = self._embed([f"Passage: {chunk}" for chunk in chunks])
         created_at = datetime.now(timezone.utc).isoformat()
@@ -137,7 +170,7 @@ class RAGStore:
         with self._conn() as conn:
             conn.execute("PRAGMA foreign_keys=ON")
             old = conn.execute(
-                "SELECT id FROM knowledge_files WHERE filename=? COLLATE NOCASE", (filename,)
+                "SELECT id FROM knowledge_files WHERE filename=? COLLATE NOCASE AND owner_id=?", (filename, owner_id)
             ).fetchone()
             if old:
                 file_id = old[0]
@@ -146,8 +179,8 @@ class RAGStore:
                 conn.execute("UPDATE knowledge_files SET content=?, created_at=? WHERE id=?", (content, created_at, file_id))
             else:
                 conn.execute(
-                    "INSERT INTO knowledge_files(id, filename, content, created_at) VALUES (?, ?, ?, ?)",
-                    (file_id, filename, content, created_at),
+                    "INSERT INTO knowledge_files(id, owner_id, filename, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (file_id, owner_id, filename, content, created_at),
                 )
             for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
                 conn.execute(
@@ -160,34 +193,34 @@ class RAGStore:
                 )
         return {"id": file_id, "filename": filename, "chunks": len(chunks)}
 
-    def delete_file(self, file_id: str) -> bool:
+    def delete_file(self, file_id: str, owner_id: str) -> bool:
         with self._conn() as conn:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("DELETE FROM docs WHERE json_extract(metadata, '$.file_id')=?", (file_id,))
-            cursor = conn.execute("DELETE FROM knowledge_files WHERE id=?", (file_id,))
+            cursor = conn.execute("DELETE FROM knowledge_files WHERE id=? AND owner_id=?", (file_id, owner_id))
         return cursor.rowcount > 0
 
-    def add(self, content: str, metadata: Optional[Dict] = None):
-        return self.upsert_file((metadata or {}).get("filename", "手动录入.md"), content)
+    def add(self, content: str, owner_id: str, metadata: Optional[Dict] = None):
+        return self.upsert_file((metadata or {}).get("filename", "手动录入.md"), content, owner_id)
 
     @staticmethod
     def _cosine(left: List[float], right: List[float]) -> float:
         denominator = math.sqrt(sum(x * x for x in left) * sum(y * y for y in right))
         return sum(x * y for x, y in zip(left, right)) / denominator if denominator else 0.0
 
-    def search(self, query: str, k: int = 5) -> List[Dict]:
+    def search(self, query: str, k: int = 5, owner_id: str = "legacy") -> List[Dict]:
         text = (query or "").strip()
         if not text:
             return []
         with self._conn() as conn:
-            if not conn.execute("SELECT 1 FROM knowledge_chunks LIMIT 1").fetchone():
+            if not conn.execute("SELECT 1 FROM knowledge_chunks c JOIN knowledge_files f ON f.id=c.file_id WHERE f.owner_id=? LIMIT 1", (owner_id,)).fetchone():
                 return []
         query_vector = self._embed([
             f"Instruct: Retrieve relevant passages that answer the query\nQuery: {text}"
         ])[0]
         with self._conn() as conn:
             rows = conn.execute("""SELECT c.content, c.embedding, f.filename
-                FROM knowledge_chunks c JOIN knowledge_files f ON f.id=c.file_id""").fetchall()
+                FROM knowledge_chunks c JOIN knowledge_files f ON f.id=c.file_id WHERE f.owner_id=?""", (owner_id,)).fetchall()
         ranked = [
             {"content": row[0], "metadata": {"filename": row[2]}, "score": self._cosine(query_vector, json.loads(row[1]))}
             for row in rows
@@ -195,6 +228,172 @@ class RAGStore:
         return sorted(ranked, key=lambda item: item["score"], reverse=True)[:max(0, min(k, 20))]
 
 rags = RAGStore(RAG_DB_PATH)
+app = FastAPI(title="ChatAI")
+
+
+@contextmanager
+def _auth_conn():
+    conn = sqlite3.connect(AUTH_DB_PATH.as_posix())
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+with _auth_conn() as conn:
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS chat_sessions (session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, title TEXT NOT NULL DEFAULT '新对话', updated_at TEXT NOT NULL)")
+
+
+def _hash_password(password: str, salt: Optional[bytes] = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
+    return f"{salt.hex()}${digest.hex()}"
+
+
+def _password_matches(password: str, stored: str) -> bool:
+    try:
+        salt_hex, digest_hex = stored.split("$", 1)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 310_000).hex()
+        return hmac.compare_digest(actual, digest_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def _public_user(user: sqlite3.Row) -> Dict:
+    return {"id": user["id"], "email": user["email"], "name": user["display_name"]}
+
+
+def current_user(request: Request) -> Dict:
+    token = request.cookies.get(AUTH_COOKIE)
+    if not token:
+        raise HTTPException(401, "请先登录")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with _auth_conn() as conn:
+        row = conn.execute("SELECT u.id, u.email, u.display_name FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?", (token_hash, int(time.time()))).fetchone()
+    if not row:
+        raise HTTPException(401, "登录已过期，请重新登录")
+    return _public_user(row)
+
+
+def require_owned_session(session_id: str, user: Dict):
+    with _auth_conn() as conn:
+        row = conn.execute("SELECT 1 FROM chat_sessions WHERE session_id=? AND user_id=?", (session_id, user["id"])).fetchone()
+    if not row:
+        raise HTTPException(404, "会话不存在")
+
+
+def _issue_session(user_id: str, response: Response):
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with _auth_conn() as conn:
+        conn.execute("INSERT INTO auth_sessions(token_hash,user_id,expires_at) VALUES(?,?,?)", (token_hash, user_id, int(time.time()) + AUTH_MAX_AGE))
+    response.set_cookie(AUTH_COOKIE, token, max_age=AUTH_MAX_AGE, httponly=True, samesite="lax", secure=False, path="/")
+
+
+class AuthRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+
+
+class SessionCreateRequest(BaseModel):
+    session_id: str
+    title: Optional[str] = None
+
+
+@app.post("/api/auth/register")
+def register(payload: AuthRequest, response: Response):
+    email = payload.email.strip().lower()
+    password = payload.password
+    name = (payload.name or email.split("@", 1)[0]).strip()[:48]
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(400, "请输入有效的邮箱地址")
+    if len(password) < 8 or len(password) > 256:
+        raise HTTPException(400, "密码长度需要在 8 到 256 个字符之间")
+    user_id = secrets.token_hex(16)
+    try:
+        with _auth_conn() as conn:
+            conn.execute("INSERT INTO users(id,email,display_name,password_hash,created_at) VALUES(?,?,?,?,?)", (user_id, email, name or "新用户", _hash_password(password), datetime.now(timezone.utc).isoformat()))
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "该邮箱已注册，请直接登录") from exc
+    rags.claim_legacy_files(user_id)
+    _issue_session(user_id, response)
+    return {"id": user_id, "email": email, "name": name or "新用户"}
+
+
+@app.post("/api/auth/login")
+def login(payload: AuthRequest, response: Response):
+    email = payload.email.strip().lower()
+    with _auth_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email=? COLLATE NOCASE", (email,)).fetchone()
+    if not row or not _password_matches(payload.password, row["password_hash"]):
+        raise HTTPException(401, "邮箱或密码不正确")
+    _issue_session(row["id"], response)
+    return _public_user(row)
+
+
+@app.get("/api/auth/me")
+def auth_me(user: Dict = Depends(current_user)):
+    return user
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response, user: Dict = Depends(current_user)):
+    token = request.cookies.get(AUTH_COOKIE, "")
+    with _auth_conn() as conn:
+        conn.execute("DELETE FROM auth_sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
+    response.delete_cookie(AUTH_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/chat/sessions")
+def list_chat_sessions(user: Dict = Depends(current_user)):
+    with _auth_conn() as conn:
+        rows = conn.execute("SELECT session_id,title,updated_at FROM chat_sessions WHERE user_id=? ORDER BY updated_at DESC", (user["id"],)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/chat/sessions")
+def create_chat_session(payload: SessionCreateRequest, user: Dict = Depends(current_user)):
+    if not payload.session_id or len(payload.session_id) > 100:
+        raise HTTPException(400, "无效的会话编号")
+    title = (payload.title or "新对话").strip()[:80] or "新对话"
+    with _auth_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO chat_sessions(session_id,user_id,title,updated_at) VALUES(?,?,?,?)", (payload.session_id,user["id"],title,datetime.now(timezone.utc).isoformat()))
+        row = conn.execute("SELECT user_id FROM chat_sessions WHERE session_id=?", (payload.session_id,)).fetchone()
+    if not row or row["user_id"] != user["id"]:
+        raise HTTPException(404, "会话不存在")
+    return {"session_id": payload.session_id, "title": title}
+
+
+@app.delete("/api/chat/sessions/{session_id}")
+def delete_chat_session(session_id: str, user: Dict = Depends(current_user)):
+    require_owned_session(session_id, user)
+    get_message_history(session_id).clear()
+    with _auth_conn() as conn:
+        conn.execute("DELETE FROM chat_sessions WHERE session_id=? AND user_id=?", (session_id,user["id"]))
+    return {"ok": True}
+
+
+def touch_chat_session(session_id: str, user: Dict, message: str):
+    title = (message.strip().splitlines()[0][:48] or "新对话")
+    with _auth_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO chat_sessions(session_id,user_id,title,updated_at) VALUES(?,?,?,?)", (session_id,user["id"],title,datetime.now(timezone.utc).isoformat()))
+        row = conn.execute("SELECT user_id,title FROM chat_sessions WHERE session_id=?", (session_id,)).fetchone()
+        if not row or row["user_id"] != user["id"]:
+            raise HTTPException(404, "会话不存在")
+        if row["title"] == "新对话":
+            conn.execute("UPDATE chat_sessions SET title=?,updated_at=? WHERE session_id=?", (title,datetime.now(timezone.utc).isoformat(),session_id))
+        else:
+            conn.execute("UPDATE chat_sessions SET updated_at=? WHERE session_id=?", (datetime.now(timezone.utc).isoformat(),session_id))
 
 def build_chain():
     prompt = ChatPromptTemplate.from_messages(
@@ -225,8 +424,6 @@ def build_chain():
     return with_history
 
 
-app = FastAPI(title="ChatBot with Memory")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173"],
@@ -238,12 +435,12 @@ app.add_middleware(
 
 
 @app.get("/api/rag/files")
-def rag_list_files():
-    return rags.list_files()
+def rag_list_files(user: Dict = Depends(current_user)):
+    return rags.list_files(user["id"])
 
 
 @app.post("/api/rag/files", status_code=201)
-async def rag_upload_file(file: UploadFile = File(...)):
+async def rag_upload_file(file: UploadFile = File(...), user: Dict = Depends(current_user)):
     filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
     if not filename or not filename.lower().endswith(".md"):
         raise HTTPException(status_code=400, detail="仅支持上传 .md Markdown 文件")
@@ -256,30 +453,31 @@ async def rag_upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="文件必须使用 UTF-8 编码") from exc
     if not content:
         raise HTTPException(status_code=400, detail="Markdown 文件内容为空")
-    return rags.upsert_file(filename, content)
+    return rags.upsert_file(filename, content, user["id"])
 
 
 @app.get("/api/rag/files/{file_id}")
-def rag_preview_file(file_id: str):
-    document = rags.get_file(file_id)
+def rag_preview_file(file_id: str, user: Dict = Depends(current_user)):
+    document = rags.get_file(file_id, user["id"])
     if not document:
         raise HTTPException(status_code=404, detail="文件不存在")
     return document
 
 
 @app.delete("/api/rag/files/{file_id}")
-def rag_delete_file(file_id: str):
-    if not rags.delete_file(file_id):
+def rag_delete_file(file_id: str, user: Dict = Depends(current_user)):
+    if not rags.delete_file(file_id, user["id"]):
         raise HTTPException(status_code=404, detail="文件不存在")
     return {"ok": True}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+def chat(req: ChatRequest, user: Dict = Depends(current_user)) -> ChatResponse:
     if not req.session_id or not req.message:
         raise HTTPException(status_code=400, detail="session_id 与 message 均为必填")
+    touch_chat_session(req.session_id, user, req.message)
     chain = build_chain()
-    docs = rags.search(req.message, k=4)
+    docs = rags.search(req.message, k=4, owner_id=user["id"])
     context = "\n\n".join(
         f"[资料：{d['metadata']['filename']}]\n{d['content']}" for d in docs
     ) if docs else "（知识库暂无可检索资料）"
@@ -291,11 +489,12 @@ def chat(req: ChatRequest) -> ChatResponse:
     return ChatResponse(session_id=req.session_id, reply=reply)
 
 @app.get("/api/chat/stream")
-def chat_stream(session_id: str, message: str, request: Request):
+def chat_stream(session_id: str, message: str, request: Request, user: Dict = Depends(current_user)):
     if not session_id or not message:
         raise HTTPException(status_code=400, detail="session_id 与 message 均为必填")
+    touch_chat_session(session_id, user, message)
     chain = build_chain()
-    docs = rags.search(message, k=4)
+    docs = rags.search(message, k=4, owner_id=user["id"])
     context = "\n\n".join(
         f"[资料：{d['metadata']['filename']}]\n{d['content']}" for d in docs
     ) if docs else "（知识库暂无可检索资料）"
@@ -326,21 +525,22 @@ class IngestRequest(BaseModel):
     metadata: Optional[Dict] = None
 
 @app.post("/api/rag/ingest")
-def rag_ingest(req: IngestRequest):
+def rag_ingest(req: IngestRequest, user: Dict = Depends(current_user)):
     if not req.content or len(req.content.strip()) == 0:
         raise HTTPException(status_code=400, detail="content 必填")
-    rags.add(req.content.strip(), req.metadata or {})
+    rags.add(req.content.strip(), user["id"], req.metadata or {})
     return {"ok": True}
 
 @app.get("/api/rag/search")
-def rag_search(q: str, k: int = 5):
-    items = rags.search(q, k)
+def rag_search(q: str, k: int = 5, user: Dict = Depends(current_user)):
+    items = rags.search(q, k, owner_id=user["id"])
     return items
 
 @app.get("/api/history/{session_id}")
-def get_history(session_id: str):
+def get_history(session_id: str, user: Dict = Depends(current_user)):
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id 必填")
+    require_owned_session(session_id, user)
     history = get_message_history(session_id)
     messages: Dict[str, str] = []
     try:
@@ -354,9 +554,10 @@ def get_history(session_id: str):
 
 
 @app.delete("/api/history/{session_id}")
-def clear_history(session_id: str):
+def clear_history(session_id: str, user: Dict = Depends(current_user)):
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id 必填")
+    require_owned_session(session_id, user)
     history = get_message_history(session_id)
     try:
         history.clear()
