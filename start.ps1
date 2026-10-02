@@ -147,4 +147,4 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
   } catch { }
 }
 if (-not $ready) { throw 'Application startup failed. Check backend/server-error.log and frontend/server-error.log.' }
-Write-Host "chatAI is ready at http://localhost:$FrontendPort using local model $Model."
+Write-Host "chatAI is ready at http://localhost:$FrontendPort using the configured global model settings."

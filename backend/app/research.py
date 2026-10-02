@@ -565,8 +565,9 @@ class ResearchEngine:
 
     @staticmethod
     def _call_model(system: str, prompt: str, temperature: float = 0.35, max_tokens: int = 2048) -> str:
-        # Qwen3 can use part of its generation budget for hidden reasoning;
-        # generation limits are profile-specific and handled by the adapter.
+        # The adapter keeps profile limits for local Ollama, and raises the
+        # per-call ceiling for hosted reasoning models whose thinking tokens
+        # share the same completion budget as the visible response.
         response = OpenAICompatibleChatModel.from_environment().generate(
             system, prompt, temperature=temperature, max_tokens=max_tokens,
         )
@@ -695,7 +696,15 @@ class ResearchEngine:
                             completed.append(f"{AGENTS[agent_id].name}：\n{item['content'][:1100]}")
                     if not completed:
                         with connection() as conn:
-                            conn.execute("UPDATE research_runs SET status='failed',error='所有研究智能体均未能完成本轮，请检查 Ollama 后继续。',updated_at=? WHERE id=?", (utc_now(), run_id))
+                            failures = conn.execute("SELECT content FROM research_outputs WHERE run_id=? AND round_no=? AND status='failed' ORDER BY created_at", (run_id, round_no)).fetchall()
+                        first_failure = str(failures[0]["content"] if failures else "")
+                        if first_failure.startswith("本智能体本轮运行失败："):
+                            first_failure = first_failure.removeprefix("本智能体本轮运行失败：")
+                        run_error = "本轮没有研究智能体成功完成。"
+                        if first_failure:
+                            run_error += f"首个模型错误：{first_failure[:420]}"
+                        with connection() as conn:
+                            conn.execute("UPDATE research_runs SET status='failed',error=?,updated_at=? WHERE id=?", (run_error, utc_now(), run_id))
                             conn.commit()
                         return
                     debate_modes = {"theory_attack", "peer_review", "experiment_design"}

@@ -8,6 +8,18 @@ from app.model_settings import model_settings
 from .models import ModelResponse
 
 
+def completion_token_limit(provider: str, model: str, requested: int) -> int:
+    """Keep profile-sized local outputs, but allow enough room for hosted reasoning models."""
+    if provider != "remote" or "deepseek" not in model.casefold():
+        return requested
+    model_id = model.casefold()
+    # DeepSeek reasoning tokens and the visible answer share max_tokens. The
+    # research profiles' 800–1,600 token caps can be consumed before an answer
+    # is produced, even when the prompt easily fits the context window.
+    minimum = 16_384 if any(marker in model_id for marker in ("reasoner", "r1", "thinking", "v4", "flash")) else 8_192
+    return max(requested, minimum)
+
+
 class OpenAICompatibleChatModel:
     def __init__(self, base_url: str, model: str, api_key: str = "ollama", timeout: float = 600):
         self.base_url = base_url.rstrip("/")
@@ -36,9 +48,11 @@ class OpenAICompatibleChatModel:
         )
 
     def generate(self, system: str, prompt: str, *, temperature: float = 0.35, max_tokens: int = 2048) -> ModelResponse:
+        settings = model_settings.get()
+        output_limit = completion_token_limit(settings["provider"], self.model, max_tokens)
         response = httpx.post(
             f"{self.base_url}/chat/completions",
-            json={"model": self.model, "stream": False, "temperature": temperature, "max_tokens": max_tokens,
+            json={"model": self.model, "stream": False, "temperature": temperature, "max_tokens": output_limit,
                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]},
             headers={"Authorization": f"Bearer {self.api_key}"}, timeout=self.timeout, trust_env=False,
         )
@@ -53,13 +67,13 @@ class OpenAICompatibleChatModel:
             if response.status_code == 400 and any(marker in normalized for marker in (
                 "context length", "context window", "input length", "num_ctx", "prompt is too long", "exceeds the available context"
             )):
-                raise RuntimeError("本地模型上下文窗口不足，提示词与生成长度超过模型限制。系统已记录服务端说明；请缩短研究输入或调整模型上下文长度。")
+                raise RuntimeError("模型服务报告输入或生成长度超过上下文窗口限制；这与单次输出上限不同。请查看服务端返回的具体限制。")
             raise RuntimeError(f"模型服务请求失败（HTTP {response.status_code}）：{detail}")
         choice = response.json().get("choices", [{}])[0]
         text = choice.get("message", {}).get("content", "").strip()
         finish_reason = choice.get("finish_reason") or ""
         if not text:
             if finish_reason == "length":
-                raise RuntimeError("模型思考过程耗尽了生成长度，请检查研究输出长度设置")
+                raise RuntimeError(f"模型达到本次生成上限（max_tokens={output_limit}），没有留下可用正文；这不一定表示输入超出上下文窗口。")
             raise RuntimeError("模型服务没有返回正文")
         return ModelResponse(text=text, model=self.model, finish_reason=finish_reason)

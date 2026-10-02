@@ -3,10 +3,15 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.research import ResearchEngine
+from app.providers.openai_compatible import completion_token_limit
 
 
 class ResearchModelAdapterTests(unittest.TestCase):
-    @patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://127.0.0.1:11434/v1", "RESEARCH_MODEL": "research-test"})
+    def test_deepseek_reasoning_models_get_a_reasonable_completion_budget(self):
+        self.assertEqual(completion_token_limit("remote", "deepseek-reasoner", 1200), 16384)
+        self.assertEqual(completion_token_limit("remote", "deepseek-chat", 800), 8192)
+        self.assertEqual(completion_token_limit("local", "deepseek-reasoner", 1200), 1200)
+
     @patch("app.providers.openai_compatible.httpx.post")
     def test_uses_configured_model_and_profile_generation_limits(self, post):
         response = Mock()
@@ -16,7 +21,10 @@ class ResearchModelAdapterTests(unittest.TestCase):
         }
         post.return_value = response
 
-        answer = ResearchEngine._call_model("system", "question", temperature=0.2, max_tokens=777)
+        with patch("app.providers.openai_compatible.model_settings.get", return_value={
+            "provider": "local", "ollama_url": "http://127.0.0.1:11434", "local_research_model": "research-test",
+        }):
+            answer = ResearchEngine._call_model("system", "question", temperature=0.2, max_tokens=777)
 
         self.assertEqual(answer, "分析结果")
         args, kwargs = post.call_args
@@ -34,8 +42,11 @@ class ResearchModelAdapterTests(unittest.TestCase):
         }
         post.return_value = response
 
-        with self.assertRaisesRegex(RuntimeError, "耗尽了生成长度"):
-            ResearchEngine._call_model("system", "question")
+        with patch("app.providers.openai_compatible.model_settings.get", return_value={
+            "provider": "local", "ollama_url": "http://127.0.0.1:11434", "local_research_model": "research-test",
+        }):
+            with self.assertRaisesRegex(RuntimeError, "生成上限"):
+                ResearchEngine._call_model("system", "question")
 
     @patch("app.providers.openai_compatible.httpx.post")
     def test_supports_configured_openai_compatible_endpoint(self, post):
@@ -60,8 +71,11 @@ class ResearchModelAdapterTests(unittest.TestCase):
         response.json.return_value = {"error": {"message": "prompt exceeds the available context length"}}
         post.return_value = response
 
-        with self.assertRaisesRegex(RuntimeError, "上下文窗口不足"):
-            ResearchEngine._call_model("system", "long prompt")
+        with patch("app.providers.openai_compatible.model_settings.get", return_value={
+            "provider": "local", "ollama_url": "http://127.0.0.1:11434", "local_research_model": "research-test",
+        }):
+            with self.assertRaisesRegex(RuntimeError, "上下文窗口限制"):
+                ResearchEngine._call_model("system", "long prompt")
 
     def test_synthesis_prompt_is_bounded_for_small_local_context(self):
         outputs = [f"专家{i}：\n" + ("[finding] 支持该推论但仍需检验 [W1]。" * 100) for i in range(6)]

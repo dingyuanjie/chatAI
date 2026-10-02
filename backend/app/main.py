@@ -29,6 +29,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from langchain_community.chat_message_histories import SQLChatMessageHistory
 from langchain_openai import ChatOpenAI
+from app.providers.openai_compatible import completion_token_limit
 
 logger = logging.getLogger(__name__)
 
@@ -567,12 +568,13 @@ def build_chain():
         model_name = settings["local_chat_model"]
         base_url = f"{settings['ollama_url']}/v1"
         api_key = "ollama"
+    chat_output_tokens = completion_token_limit(settings["provider"], model_name, 4096)
     model = ChatOpenAI(
         model=model_name,
         api_key=api_key,
         base_url=base_url,
         temperature=0.3,
-        max_tokens=4096,
+        max_tokens=chat_output_tokens,
         timeout=180,
         max_retries=0,
         http_client=httpx.Client(trust_env=False, timeout=180),
