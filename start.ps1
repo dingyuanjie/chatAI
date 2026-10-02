@@ -3,13 +3,15 @@ Param(
   [int]$BackendPort = 8000,
   [switch]$Install,
   [string]$BaseUrl = 'http://127.0.0.1:11434/v1',
-  [string]$Model = 'chatai-local'
+  [string]$Model = 'chatai-local',
+  [string]$ResearchModel = 'qwen3:4b-instruct-2507-q4_K_M'
 )
 $ErrorActionPreference = 'Stop'
 $backend = Join-Path $PSScriptRoot 'backend'
 $frontend = Join-Path $PSScriptRoot 'frontend'
 $env:OLLAMA_BASE_URL = $BaseUrl
 $env:LOCAL_MODEL = $Model
+$env:RESEARCH_MODEL = $ResearchModel
 $env:CHATAI_BACKEND_URL = "http://127.0.0.1:$BackendPort"
 try {
   $models = Invoke-RestMethod ($BaseUrl.TrimEnd('/') + '/models') -TimeoutSec 5
@@ -23,6 +25,9 @@ if ($Model -notin $models.data.id -and "${Model}:latest" -notin $models.data.id)
   if ($Model -eq 'chatai-local' -and $BaseUrl.TrimEnd('/') -eq 'http://127.0.0.1:11434/v1') {
     & (Join-Path $PSScriptRoot 'setup-local-model.ps1')
   } else { throw "Model $Model is missing from $BaseUrl." }
+}
+if ($ResearchModel -notin $models.data.id -and "${ResearchModel}:latest" -notin $models.data.id) {
+  throw "Research model $ResearchModel is missing. Run .\setup-local-model.ps1 to download it, then restart."
 }
 $embeddingModel = 'qwen3-embedding:0.6b'
 $embeddingAvailable = $false

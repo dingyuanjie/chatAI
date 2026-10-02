@@ -228,7 +228,7 @@ class RAGStore:
         return sorted(ranked, key=lambda item: item["score"], reverse=True)[:max(0, min(k, 20))]
 
 rags = RAGStore(RAG_DB_PATH)
-app = FastAPI(title="ChatAI")
+app = FastAPI(title="Structural Vital Force Theory Research Workspace")
 
 
 @contextmanager
@@ -398,7 +398,7 @@ def touch_chat_session(session_id: str, user: Dict, message: str):
 def build_chain():
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", "你是中文知识库助手，会结合对话记忆回答。回答知识库问题时，优先依据资料片段，用 [文件名] 标出依据；资料没有答案时，明确说知识库中没有找到，不得编造。\n资料片段：\n{context}"),
+            ("system", "你是结构生力理论研究助手，结合对话上下文与用户提供的理论资料回答问题，并跟随用户使用的语言作答。涉及理论依据时优先引用资料片段，用 [文件名] 标出来源；资料没有支撑时明确说明，区分资料内容与推断，不要编造理论定义。\n资料片段：\n{context}"),
             MessagesPlaceholder(variable_name="history"),
             ("human", "{input}"),
         ]
@@ -564,3 +564,8 @@ def clear_history(session_id: str, user: Dict = Depends(current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True}
+
+
+from .research import create_research_router
+
+app.include_router(create_research_router(current_user, rags))

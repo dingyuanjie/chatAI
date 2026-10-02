@@ -31,6 +31,8 @@ catch {
 }
 & $ollamaExe pull qwen3:4b
 if ($LASTEXITCODE -ne 0) { throw 'Model download failed.' }
+& $ollamaExe pull qwen3:4b-instruct-2507-q4_K_M
+if ($LASTEXITCODE -ne 0) { throw 'Research model download failed.' }
 & $ollamaExe create chatai-local -f (Join-Path $PSScriptRoot 'backend/Modelfile')
 if ($LASTEXITCODE -ne 0) { throw 'Model creation failed.' }
 & $ollamaExe pull qwen3-embedding:0.6b
