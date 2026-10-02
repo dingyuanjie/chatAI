@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Button, ConfigProvider, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Spin, Switch, Upload, message as toast, theme as antdTheme } from "antd";
+import { Button, ConfigProvider, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Select, Spin, Switch, Upload, message as toast, theme as antdTheme } from "antd";
 import {
   ArrowDownOutlined, ArrowRightOutlined, BulbOutlined, CheckOutlined, DeleteOutlined, ExperimentOutlined, FileMarkdownOutlined,
   LogoutOutlined, MenuOutlined, MessageOutlined, MoonOutlined, PaperClipOutlined, PlusOutlined, SunOutlined,
@@ -21,9 +21,16 @@ type KnowledgeFile = { id: string; filename: string; created_at: string; chunks:
 type PreviewFile = { id: string; filename: string; content: string };
 type Locale = "zh" | "en";
 type Theme = "light" | "dark";
-type ResearchAgent = { id: string; name: string; name_en: string; focus: string };
+type ResearchAgent = { id: string; name: string; name_en: string; focus: string; focus_en: string; layer: string };
+type ResearchWorkflow = { id: string; name: string; name_en: string; budgets: Record<string, { max_active_agents: number; max_parallel_agents: number; max_debate_rounds: number; max_context_tokens: number }> };
 type ResearchOutput = { id: string; run_id: string; round_no: number; agent_id: string; agent_name: string; status: string; content: string; sources: { provider: string; title: string; url: string; snippet?: string }[] };
-type ResearchRun = { id: string; title: string; question: string; agents: string[]; max_rounds: number | null; continuous: boolean; current_round: number; status: string; summary: string; error: string; updated_at: string; outputs?: ResearchOutput[] };
+type ResearchTask = { id: string; round_no: number; stage: string; agent_id: string; status: string; attempt: number; error: string };
+type ResearchEvidence = { id: string; round_no: number; provider: string; source_type: string; title: string; url: string; snippet: string; cited_by: string[] };
+type ResearchClaimEvidence = { id: string; citation_label: string; source_type: string; title: string; url: string; relation: string };
+type ResearchClaim = { id: string; round_no: number; agent_id: string; claim_text: string; claim_type: string; epistemic_status: string; uncertainty: string; evidence: ResearchClaimEvidence[] };
+type ResearchMemory = { id: string; title: string; question: string; round_no: number; summary: string; relevance?: number; open_questions: { text: string; type: string }[] };
+type ResearchGraph = { run_id: string; round_start: number; round_end: number; nodes: { id: string; type: string; label: string; relation?: string; status?: string; round_no?: number; stage?: string; preview?: string; source_type?: string; url?: string; external_run?: boolean }[]; edges: { source: string; target: string; relation: string; relevance?: string }[] };
+type ResearchRun = { id: string; title: string; question: string; agents: string[]; workflow_mode: string; research_depth: string; route_reason: string; current_stage?: string; tasks?: ResearchTask[]; evidence?: ResearchEvidence[]; claims?: ResearchClaim[]; related_memory?: ResearchMemory[]; memory?: ResearchMemory[]; max_rounds: number | null; continuous: boolean; current_round: number; status: string; summary: string; error: string; updated_at: string; outputs?: ResearchOutput[] };
 
 const newId = () => crypto.randomUUID();
 const apiErrorInEnglish: Record<string, string> = {
@@ -102,35 +109,41 @@ function AuthScreen({ onAuth, locale, setLocale, theme, setTheme }: {
   </main>;
 }
 
-const agentFocusEn: Record<string, string> = {
-  physics: "Fields, spacetime, symmetry, and fundamental interactions",
-  math: "Formal structures, axioms, symmetry, and provability",
-  complexity: "Complex systems, nonlinear dynamics, networks, and emergence",
-  cosmology: "Cosmology, the early universe, observations, and standard models",
-  foundations: "Philosophy of science, unification, concepts, and cross-disciplinary links",
-  critic: "Counterexamples, evidence gaps, falsifiability, and alternatives",
-};
-
 function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: string) => string }) {
   const [agents, setAgents] = useState<ResearchAgent[]>([]);
+  const [workflows, setWorkflows] = useState<ResearchWorkflow[]>([]);
   const [runs, setRuns] = useState<ResearchRun[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [detail, setDetail] = useState<ResearchRun | null>(null);
   const [selectedOutput, setSelectedOutput] = useState<ResearchOutput | null>(null);
+  const [graph, setGraph] = useState<ResearchGraph | null>(null);
+  const [graphOpen, setGraphOpen] = useState(false);
+  const [graphBusy, setGraphBusy] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [question, setQuestion] = useState("");
   const [selectedAgents, setSelectedAgents] = useState(["physics", "math", "complexity", "critic"]);
+  const [autoRoute, setAutoRoute] = useState(true);
+  const [workflowMode, setWorkflowMode] = useState("multidisciplinary");
+  const [researchDepth, setResearchDepth] = useState("normal");
   const [maxRounds, setMaxRounds] = useState<number | null>(5);
   const [continuous, setContinuous] = useState(false);
   const [creating, setCreating] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [filter, setFilter] = useState("all");
-  const agentName = (agentId: string) => {
+  const maxSelectableAgents = Math.min(researchDepth === "fast" ? 3 : researchDepth === "deep" ? 15 : 7, agents.length);
+  const agentName = (agentId: string, fallback?: string) => {
     const agent = agents.find((item) => item.id === agentId);
-    if (!agent) return agentId;
+    if (!agent) return fallback || agentId;
     return locale === "zh" ? agent.name : agent.name_en;
   };
+  const workflowName = (workflowId: string) => {
+    const workflow = workflows.find((item) => item.id === workflowId);
+    return workflow ? (locale === "zh" ? workflow.name : workflow.name_en) : workflowId;
+  };
+  const depthName = (depth: string) => ({
+    fast: t("快速", "Fast"), normal: t("标准", "Standard"), deep: t("深度", "Deep"),
+  }[depth] || depth);
   const statusLabel = (status: string) => ({
     queued: t("排队中", "Queued"), running: t("探索中", "Running"), pause_requested: t("正在暂停…", "Pausing…"),
     paused: t("已暂停", "Paused"), cancel_requested: t("正在停止…", "Stopping…"), cancelled: t("已停止", "Stopped"),
@@ -148,8 +161,9 @@ function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: s
   }, []);
 
   useEffect(() => {
-    Promise.all([axios.get<ResearchAgent[]>("/api/research/agents"), refreshRuns()]).then(([agentResponse, currentRuns]) => {
+    Promise.all([axios.get<ResearchAgent[]>("/api/research/agents"), axios.get<ResearchWorkflow[]>("/api/research/workflows"), refreshRuns()]).then(([agentResponse, workflowResponse, currentRuns]) => {
       setAgents(agentResponse.data);
+      setWorkflows(workflowResponse.data);
       if (currentRuns.length) setSelectedId((existing) => existing || currentRuns[0].id);
     }).catch((error) => toast.error(apiErrorText(error, locale, t("无法加载科学探索工作区", "Could not load the science workspace"))));
   }, [refreshRuns, locale, t]);
@@ -174,13 +188,13 @@ function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: s
 
   const createRun = async () => {
     const cleanQuestion = question.trim();
-    if (cleanQuestion.length < 8 || selectedAgents.length < 2) {
-      toast.error(t("请填写研究问题并至少选择两个智能体", "Enter a research question and select at least two agents"));
+    if (cleanQuestion.length < 8 || (!autoRoute && (selectedAgents.length < 2 || selectedAgents.length > maxSelectableAgents))) {
+      toast.error(t("请填写研究问题，并确保手动选择的智能体数量符合当前研究档位", "Enter a question and choose a valid number of agents for this depth"));
       return;
     }
     setCreating(true);
     try {
-      const payload = { title: title.trim() || cleanQuestion.split("\n")[0].slice(0, 80), question: cleanQuestion, agents: selectedAgents, max_rounds: continuous ? 0 : (maxRounds || 5) };
+      const payload = { title: title.trim() || cleanQuestion.split("\n")[0].slice(0, 80), question: cleanQuestion, agents: autoRoute ? [] : selectedAgents, workflow_mode: workflowMode, research_depth: researchDepth, max_rounds: continuous ? 0 : (maxRounds || 5) };
       const { data } = await axios.post<ResearchRun>("/api/research/runs", payload);
       setCreateOpen(false); setQuestion(""); setTitle("");
       await refreshRuns(); setSelectedId(data.id);
@@ -199,8 +213,29 @@ function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: s
     finally { setActionBusy(false); }
   };
 
+  const toggleResearchGraph = async () => {
+    if (graphOpen) { setGraphOpen(false); return; }
+    setGraphOpen(true);
+    setGraphBusy(true);
+    try {
+      const { data } = await axios.get<ResearchGraph>(`/api/research/runs/${selectedId}/graph`);
+      setGraph(data);
+    } catch (error) {
+      setGraphOpen(false);
+      toast.error(apiErrorText(error, locale, t("无法加载研究图谱", "Could not load the research graph")));
+    } finally { setGraphBusy(false); }
+  };
+
   const filteredRuns = runs.filter((run) => filter === "all" || run.status === filter);
   const outputs = detail?.outputs || [];
+  const tasks = detail?.tasks || [];
+  const evidence = detail?.evidence || [];
+  const claims = detail?.claims || [];
+  const relatedMemory = detail?.related_memory || [];
+  const activeTaskRound = Math.max(0, ...tasks.map((task) => task.round_no));
+  const activeTasks = tasks.filter((task) => task.round_no === activeTaskRound);
+  const graphNodeMap = new Map((graph?.nodes || []).map((node) => [node.id, node]));
+  const graphEdges = graph && graph.run_id === detail?.id ? graph.edges.slice(0, 80) : [];
   const rounds = [...new Set(outputs.map((item) => item.round_no))].sort((a, b) => b - a);
   const progress = detail?.continuous ? null : detail?.max_rounds ? Math.min(100, Math.round((detail.current_round / detail.max_rounds) * 100)) : 0;
   const statusClass = (status?: string) => status === "running" || status === "queued" ? "is-running" : status === "completed" ? "is-done" : status === "failed" ? "is-failed" : "is-paused";
@@ -219,16 +254,22 @@ function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: s
       </aside>
       <section className="research-detail">
         {!detail ? <div className="research-welcome"><span className="research-hero-icon"><ExperimentOutlined /></span><h2>{t("从一个问题开始", "Start with a question")}</h2><p>{t("选择多种学科视角，让理论、证据和反例在持续迭代中相遇。", "Bring theories, evidence, and counterarguments together through iterative, interdisciplinary work.")}</p><Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>{t("创建科学探索", "Create an exploration")}</Button></div> : <>
-          <div className="detail-topline"><span className={`status-chip ${statusClass(detail.status)}`}><i />{statusLabel(detail.status)}</span><span>{detail.continuous ? t(`已完成 ${detail.current_round} 轮 · 持续运行`, `${detail.current_round} rounds · continuous`) : t(`第 ${detail.current_round} / ${detail.max_rounds} 轮`, `Round ${detail.current_round} / ${detail.max_rounds}`)}</span><div className="detail-actions">
+          <div className="detail-topline"><span className={`status-chip ${statusClass(detail.status)}`}><i />{statusLabel(detail.status)}</span><span className="current-stage-label">{t("阶段", "Stage")}: {({ retrieval: t("资料检索", "Retrieval"), expert_analysis: t("专家分析", "Expert analysis"), debate: t("交叉质疑", "Adversarial review"), synthesis: t("综合判断", "Synthesis"), queued: t("排队中", "Queued") }[detail.current_stage || "queued"] || detail.current_stage)}</span><span>{detail.continuous ? t(`已完成 ${detail.current_round} 轮 · 持续运行`, `${detail.current_round} rounds · continuous`) : t(`第 ${detail.current_round} / ${detail.max_rounds} 轮`, `Round ${detail.current_round} / ${detail.max_rounds}`)}</span><div className="detail-actions">
             {(detail.status === "running" || detail.status === "queued" || detail.status === "pause_requested") && <Button disabled={detail.status === "pause_requested" || actionBusy} onClick={() => void controlRun("pause")}>{t("暂停并保存", "Pause & checkpoint")}</Button>}
             {(detail.status === "paused" || detail.status === "failed" || detail.status === "cancelled") && <Button type="primary" loading={actionBusy} onClick={() => void controlRun("resume")}>{t("从检查点继续", "Resume from checkpoint")}</Button>}
             {(detail.status === "running" || detail.status === "queued" || detail.status === "pause_requested") && <Popconfirm title={t("停止这个探索？", "Stop this exploration?")} description={t("已有结果和检查点会保留，之后仍可继续。", "Current outputs and checkpoints will be kept; you can resume later.")} onConfirm={() => void controlRun("stop")}><Button danger loading={actionBusy}>{t("停止", "Stop")}</Button></Popconfirm>}
           </div></div>
           {progress !== null && <div className="research-progress"><div style={{ width: `${progress}%` }} /></div>}
-          <div className="detail-scroll"><div className="research-question"><div className="research-kicker">{t("核心研究问题", "RESEARCH QUESTION")}</div><h2>{detail.title}</h2><p>{detail.question}</p><div className="agent-chips">{detail.agents.map((id) => <span key={id}><i />{agentName(id)}</span>)}</div></div>
+          <div className="detail-scroll"><div className="research-question"><div className="research-kicker">{t("核心研究问题", "RESEARCH QUESTION")}</div><h2>{detail.title}</h2><p>{detail.question}</p><div className="agent-chips">{detail.agents.map((id) => <span key={id}><i />{agentName(id)}</span>)}</div><div className="route-summary"><b>{workflowName(detail.workflow_mode)} · {depthName(detail.research_depth)}</b><span>{detail.route_reason}</span></div></div>
+            <div className="graph-toggle-row"><span>{t("查看任务、主张、来源与记忆之间的关系", "Explore task, claim, source, and memory links")}</span><Button size="small" loading={graphBusy} onClick={() => void toggleResearchGraph()}>{graphOpen ? t("收起研究图谱", "Hide research graph") : t("打开研究图谱", "Open research graph")}</Button></div>
+            {graphOpen && graph?.run_id === detail.id && <section className="research-graph-board"><div className="graph-board-heading"><div><b>{t("研究关系图", "RESEARCH GRAPH")}</b><small>{t(`显示第 ${graph.round_start}–${graph.round_end} 轮 · 保留最多 50 轮`, `Rounds ${graph.round_start}–${graph.round_end} · up to 50 rounds`)}</small></div><span>{graph.nodes.length} {t("节点", "nodes")} · {graph.edges.length} {t("关系", "links")}</span></div><div className="graph-node-counts">{["task", "output", "claim", "evidence", "memory"].map((type) => <div key={type}><b>{graph.nodes.filter((node) => node.type === type).length}</b><span>{({ task: t("任务", "Tasks"), output: t("输出", "Outputs"), claim: t("主张", "Claims"), evidence: t("来源", "Sources"), memory: t("记忆", "Memories") }[type])}</span></div>)}</div><div className="graph-edge-list">{graphEdges.length === 0 ? <p>{t("当前还没有可连接的研究节点", "No linked research nodes yet")}</p> : graphEdges.map((edge, index) => { const source = graphNodeMap.get(edge.source); const target = graphNodeMap.get(edge.target); return <div className="graph-edge" key={`${edge.source}-${edge.target}-${edge.relation}-${index}`}><span className={`graph-node-type ${source?.type || ""}`}>{source?.type || "node"}</span><b title={source?.label}>{source?.label || edge.source}</b><i>→ {({ has_task: t("包含任务", "has task"), has_output: t("包含输出", "has output"), produces: t("产生", "produces"), asserts: t("提出", "asserts"), supports: t("支持", "supports"), contradicts: t("反驳", "contradicts"), context: t("参考", "references"), records: t("记录", "records"), learns_from: t("关联记忆", "learns from") }[edge.relation] || edge.relation)} →</i><span className={`graph-node-type ${target?.type || ""}`}>{target?.type || "node"}</span><b title={target?.label}>{target?.label || edge.target}</b></div>; })}</div></section>}
+            {activeTasks.length > 0 && <section className="research-stage-board"><div className="stage-board-heading"><b>{t(`第 ${activeTaskRound} 轮 · 研究阶段`, `Round ${activeTaskRound} · Research stages`)}</b><span>{activeTasks.filter((task) => task.status === "completed").length}/{activeTasks.length} {t("项完成", "complete")}</span></div><div className="stage-task-grid">{activeTasks.map((task) => <div className={`stage-task ${task.status}`} key={task.id}><span className="stage-task-dot" /><div><b>{task.agent_id === "retrieval" ? t("资料检索", "Source retrieval") : task.stage === "debate" ? t("交叉质疑", "Adversarial review") : agentName(task.agent_id)}</b><small>{({ queued: t("排队中", "Queued"), running: t("进行中", "Working"), completed: t("已完成", "Complete"), failed: t("失败", "Failed") }[task.status] || task.status)}{task.attempt > 1 ? ` · ${t(`尝试 ${task.attempt}`, `Attempt ${task.attempt}`)}` : ""}</small></div></div>)}</div></section>}
+            {relatedMemory.length > 0 && <section className="research-memory-board"><div className="memory-board-heading"><div><b>{t("关联历史研究", "RELATED RESEARCH MEMORY")}</b><small>{t("历史模型结论仅作研究线索，引用来源需重新核查", "Past model conclusions are leads; re-check their sources")}</small></div><span>{relatedMemory.length}</span></div><div className="memory-items">{relatedMemory.map((memory) => <article className="memory-item" key={`${memory.id}-${memory.round_no}`}><div><b>{memory.title}</b><span>{Math.round((memory.relevance || 0) * 100)}% {t("主题相关", "topic overlap")}</span></div><small>{memory.question}</small><p>{memory.summary}</p>{memory.open_questions.length > 0 && <div className="memory-open-questions"><b>{t("待追问题", "Open questions")}</b>{memory.open_questions.slice(0, 3).map((item, index) => <span key={index}>· {item.text}</span>)}</div>}</article>)}</div></section>}
             {detail.summary && <div className="round-summary"><div><ExperimentOutlined /> {t("当前综合摘要", "CURRENT SYNTHESIS")} · {t(`第 ${detail.current_round} 轮`, `ROUND ${detail.current_round}`)}</div><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{detail.summary}</ReactMarkdown></div>}
             {detail.error && <div className="research-error">{detail.error}</div>}
-            {rounds.length === 0 ? <div className="agent-wait"><Spin /> <span>{t("正在检索资料并启动研究智能体…", "Searching sources and starting the research agents…")}</span></div> : rounds.map((round) => <div className="output-round" key={round}><div className="round-heading"><span>{t(`第 ${round} 轮`, `ROUND ${round}`)}</span><i /><small>{outputs.filter((item) => item.round_no === round).length} {t("项输出", "outputs")}</small></div><div className="output-grid">{outputs.filter((item) => item.round_no === round).map((output) => <button className={`output-card ${output.agent_id === "synthesis" ? "synthesis-card" : ""}`} key={output.id} onClick={() => setSelectedOutput(output)}><div className="output-card-top"><span className={`status-dot ${output.status === "completed" ? "is-done" : "is-failed"}`} />{agentName(output.agent_id)}<ArrowRightOutlined /></div><p>{output.content.slice(0, 205)}{output.content.length > 205 ? "…" : ""}</p><div className="output-card-meta"><span>{output.status === "completed" ? t("预览完整输出", "Preview full output") : t("运行失败 · 查看详情", "Failed · view details")}</span><span>{output.sources.length} {t("个来源", "sources")}</span></div></button>)}</div></div>)}
+            {claims.length > 0 && <section className="research-claim-board"><div className="claim-board-heading"><div><b>{t("结构化主张", "STRUCTURED CLAIMS")}</b><small>{t("只收录智能体按明确标签标注的条目", "Only statements explicitly tagged by agents are indexed")}</small></div><span>{claims.length}</span></div><div className="claim-items">{claims.map((claim) => <article className="claim-item" key={claim.id}><div className="claim-item-heading"><span className={`claim-kind ${claim.claim_type}`}>{({ finding: t("研究发现", "Finding"), hypothesis: t("假设", "Hypothesis"), prediction: t("预测", "Prediction"), counterevidence: t("反例 / 反证", "Counterevidence"), limitation: t("限制", "Limitation") }[claim.claim_type] || claim.claim_type)}</span><span className={`claim-epistemic ${claim.epistemic_status}`}>{({ external_source: t("外部来源", "External source"), theory_internal: t("内部理论", "Internal theory"), hypothesis: t("未验证假设", "Untested hypothesis"), model_inference: t("模型推断", "Model inference") }[claim.epistemic_status] || claim.epistemic_status)}</span><small>{agentName(claim.agent_id)} · {t(`第 ${claim.round_no} 轮`, `Round ${claim.round_no}`)}</small></div><p>{claim.claim_text}</p>{claim.evidence.length > 0 && <div className="claim-evidence-links">{claim.evidence.map((ref) => <span key={`${claim.id}-${ref.id}-${ref.relation}`} className={ref.relation}>{ref.citation_label} · {ref.relation === "contradicts" ? t("反驳", "contradicts") : t("支持", "supports")} · {ref.title}</span>)}</div>}</article>)}</div></section>}
+            {evidence.length > 0 && <section className="research-evidence-board"><div className="evidence-board-heading"><div><b>{t("可追溯来源", "TRACEABLE SOURCES")}</b><small>{t("来源已关联到引用它的智能体输出；数据库记录不代表同行评审", "Sources link to agent outputs; bibliographic records are not proof of peer review")}</small></div><span>{evidence.length}</span></div><div className="evidence-items">{evidence.map((item) => <article className="evidence-item" key={item.id}><div className="evidence-item-heading"><span className={`evidence-kind ${item.source_type}`}>{({ theory_internal: t("理论内部资料", "Internal theory"), bibliographic_record: t("文献数据库记录", "Bibliographic record"), peer_reviewed: t("已核实同行评审", "Verified peer reviewed"), preprint: t("预印本", "Preprint"), web_reference: t("网页资料", "Web source"), hypothesis: t("假设", "Hypothesis"), model_inference: t("模型推断", "Model inference"), experiment_result: t("实验结果", "Experiment") }[item.source_type] || item.source_type)}</span><b>{item.title}</b><small>{item.provider} · {t(`第 ${item.round_no} 轮`, `Round ${item.round_no}`)}</small></div>{item.snippet && <p>{item.snippet}</p>}<div className="evidence-item-foot"><span>{t("引用角色", "Used by")}: {item.cited_by.map((agentId) => agentName(agentId)).join("、") || t("尚未关联输出", "Not linked to an output")}</span>{item.url.startsWith("http") && <a href={item.url} target="_blank" rel="noreferrer">{t("打开来源", "Open source")} <ArrowRightOutlined /></a>}</div></article>)}</div></section>}
+            {rounds.length === 0 ? <div className="agent-wait"><Spin /> <span>{t("正在检索资料并启动研究智能体…", "Searching sources and starting the research agents…")}</span></div> : rounds.map((round) => <div className="output-round" key={round}><div className="round-heading"><span>{t(`第 ${round} 轮`, `ROUND ${round}`)}</span><i /><small>{outputs.filter((item) => item.round_no === round).length} {t("项输出", "outputs")}</small></div><div className="output-grid">{outputs.filter((item) => item.round_no === round).map((output) => <button className={`output-card ${output.agent_id === "synthesis" ? "synthesis-card" : ""}`} key={output.id} onClick={() => setSelectedOutput(output)}><div className="output-card-top"><span className={`status-dot ${output.status === "completed" ? "is-done" : "is-failed"}`} />{agentName(output.agent_id, output.agent_name)}<ArrowRightOutlined /></div><p>{output.content.slice(0, 205)}{output.content.length > 205 ? "…" : ""}</p><div className="output-card-meta"><span>{output.status === "completed" ? t("预览完整输出", "Preview full output") : t("运行失败 · 查看详情", "Failed · view details")}</span><span>{output.sources.length} {t("个来源", "sources")}</span></div></button>)}</div></div>)}
           </div>
         </>}
       </section>
@@ -237,8 +278,10 @@ function ScienceWorkspace({ locale, t }: { locale: Locale; t: (zh: string, en: s
     <Modal className="research-create-modal" title={<div className="research-modal-title"><ExperimentOutlined />{t("发起一轮科学探索", "Start a science exploration")}</div>} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => void createRun()} okText={t("启动多智能体探索", "Start multi-agent exploration")} cancelText={t("取消", "Cancel")} confirmLoading={creating} width={740} destroyOnClose>
       <div className="research-form"><label>{t("探索标题", "Exploration title")}</label><Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={t("例如：从简单底层原理到宇宙结构的涌现路径", "e.g. Emergence from simple foundations to cosmic structure")} maxLength={160} />
         <label>{t("核心研究问题", "Core research question")}</label><Input.TextArea value={question} onChange={(event) => setQuestion(event.target.value)} autoSize={{ minRows: 4, maxRows: 8 }} placeholder={t("例如：宇宙是否可能源于简单底层原理，并通过层层涌现形成已知现象？请比较现有理论、寻找共同结构和反证。", "Could the universe emerge from simple foundations through successive layers? Compare existing theories, look for shared structures, and seek counterevidence.")} />
-        <div className="agent-selector-head"><div><label>{t("参与的研究智能体", "Research agents")}</label><small>{t("每轮并行分析，之后由综合智能体归纳", "Analyze in parallel; a synthesis agent then reviews the findings")}</small></div><span>{selectedAgents.length}/6</span></div>
-        <div className="agent-picker">{agents.map((agent) => { const checked = selectedAgents.includes(agent.id); return <button type="button" key={agent.id} className={`agent-option ${checked ? "selected" : ""}`} onClick={() => setSelectedAgents((current) => checked ? current.filter((id) => id !== agent.id) : current.length < 6 ? [...current, agent.id] : current)}><span className="agent-check">{checked ? "✓" : "+"}</span><b>{locale === "zh" ? agent.name : agent.name_en}</b><small>{locale === "zh" ? agent.focus : agentFocusEn[agent.id]}</small></button>; })}</div>
+        <div className="run-settings"><div className="round-setting"><label>{t("协作模式", "Workflow")}</label><Select value={workflowMode} onChange={setWorkflowMode} options={workflows.map((workflow) => ({ value: workflow.id, label: locale === "zh" ? workflow.name : workflow.name_en }))} /></div><div className="round-setting"><label>{t("研究深度", "Research depth")}</label><Select value={researchDepth} onChange={(value) => { setResearchDepth(value); if (value === "fast") setSelectedAgents((current) => current.slice(0, 3)); }} options={[{ value: "fast", label: t("快速 · 最多 3 位", "Fast · up to 3") }, { value: "normal", label: t("标准 · 最多 7 位", "Normal · up to 7") }, { value: "deep", label: t("深度 · 最多 15 位", "Deep · up to 15") }]} /></div></div>
+        <div className="continuous-setting route-toggle"><div><b>{t("自动选择相关专家", "Auto-select relevant experts")}</b><small>{t("按问题领域、协作模式和计算预算路由", "Route by topic, workflow, and compute budget")}</small></div><Switch checked={autoRoute} onChange={setAutoRoute} /></div>
+        {!autoRoute && <><div className="agent-selector-head"><div><label>{t("手动指定专家", "Expert overrides")}</label><small>{t("各专家共享本地模型，仅并行运行有限数量", "Roles share one local model and run within a bounded parallel limit")}</small></div><span>{selectedAgents.length}/{maxSelectableAgents}</span></div>
+        <div className="agent-picker">{agents.map((agent) => { const checked = selectedAgents.includes(agent.id); return <button type="button" key={agent.id} className={`agent-option ${checked ? "selected" : ""}`} onClick={() => setSelectedAgents((current) => checked ? current.filter((id) => id !== agent.id) : current.length < maxSelectableAgents ? [...current, agent.id] : current)}><span className="agent-check">{checked ? "✓" : "+"}</span><b>{locale === "zh" ? agent.name : agent.name_en}</b><small>{locale === "zh" ? agent.focus : agent.focus_en}</small></button>; })}</div></>}
         <div className="run-settings"><div className="round-setting"><label>{t("迭代轮数", "Research rounds")}</label><InputNumber min={1} max={100} value={maxRounds} disabled={continuous} onChange={(value) => setMaxRounds(value)} /><span>{t("每轮都会保存检查点", "Checkpointed every round")}</span></div><div className="continuous-setting"><div><b>{t("持续运行", "Run continuously")}</b><small>{t("直到你手动暂停或停止", "Until you pause or stop it")}</small></div><Switch checked={continuous} onChange={setContinuous} /></div></div>
         <div className="research-disclaimer">{t("联网检索来源会附在每条输出中；本地知识库资料仅对当前登录账号开放。研究结果用于探索与讨论，不代表已证实的科学结论。", "Web sources are attached to each output; local library access is limited to this account. Results are exploratory and are not established scientific conclusions.")}</div>
       </div>

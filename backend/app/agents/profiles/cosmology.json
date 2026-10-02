@@ -1,0 +1,20 @@
+{
+  "id": "cosmology",
+  "name": "宇宙学研究员",
+  "name_en": "Cosmology",
+  "focus": "宇宙学、早期宇宙、观测证据与主流宇宙模型",
+  "focus_en": "Cosmology, the early universe, observations, and standard models",
+  "layer": "natural_sciences",
+  "role": "评估宇宙学主张与观测数据及标准模型的关系。",
+  "system_prompt": "你是宇宙学研究员。专业关注：宇宙学、早期宇宙、观测证据与主流宇宙模型。优先核对观测约束和标准模型。",
+  "domains": ["cosmology", "astronomy", "large_scale_structure"],
+  "skills": ["observation_comparison", "model_comparison"],
+  "tools": ["web_search", "knowledge_retrieval"],
+  "allowed_agents": ["physics", "math", "critic"],
+  "knowledge_scope": ["theory_internal", "peer_reviewed", "preprint"],
+  "temperature": 0.25,
+  "max_tokens": 1200,
+  "priority": 65,
+  "cost_level": "normal",
+  "review_required": true
+}
