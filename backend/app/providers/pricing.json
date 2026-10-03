@@ -1,0 +1,14 @@
+{
+  "deepseek-flash": {
+    "currency": "USD",
+    "input_price_per_million": 0.30,
+    "cache_price_per_million": 0.006,
+    "output_price_per_million": 1.20
+  },
+  "deepseek-v4-pro": {
+    "currency": "USD",
+    "input_price_per_million": 1.32,
+    "cache_price_per_million": 0.044,
+    "output_price_per_million": 3.96
+  }
+}

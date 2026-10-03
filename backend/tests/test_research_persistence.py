@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app import research
 from app.research import CreateResearchRun, ResearchEngine
+from app.providers.models import ModelProviderError, ModelUsage
 
 
 class ResearchPersistenceTests(unittest.TestCase):
@@ -40,6 +41,51 @@ class ResearchPersistenceTests(unittest.TestCase):
         with self.assertRaises(research.HTTPException) as error:
             self.engine.get_detail(run["id"], "owner-b")
         self.assertEqual(error.exception.status_code, 404)
+
+    def test_model_switch_usage_is_logged_without_resetting_research_memory(self):
+        payload = CreateResearchRun(title="Provider 切换", question="检查切换模型后记忆是否保留。", agents=["math", "critic"], max_rounds=0)
+        with patch.object(self.engine, "_start"):
+            run = self.engine.create(payload, "owner-a")
+        self.engine._save_output(run["id"], 1, "math", "[finding] 有一项发现需要持续跟踪。", [], "completed")
+        self.engine._save_memory(run["id"], 1, "保留的研究摘要")
+        self.engine._record_model_call(run["id"], 1, "math", "agent", "ollama", "LOCAL", "qwen-local", True,
+            usage=ModelUsage(input_tokens=100, output_tokens=30, total_tokens=130))
+        self.engine._record_model_call(run["id"], 2, "critic", "agent", "api.deepseek.com", "REMOTE", "deepseek-flash", True,
+            usage=ModelUsage(input_tokens=50, output_tokens=25, total_tokens=75, estimated_cost=0.0001, currency="USD"))
+        detail = self.engine.get_detail(run["id"], "owner-a")
+        self.assertEqual(len(detail["memory"]), 1)
+        self.assertEqual(detail["resource_usage"]["model_calls"], 2)
+        self.assertEqual(detail["resource_usage"]["total_tokens"], 205)
+        self.assertEqual({item["provider_type"] for item in detail["resource_usage"]["model_breakdown"]}, {"LOCAL", "REMOTE"})
+
+    def test_model_call_budget_is_reserved_before_parallel_requests(self):
+        payload = CreateResearchRun(title="调用预算", question="检查并发请求不会突破调用预算。", agents=["math", "critic"],
+            max_rounds=0, continuous_config={"preset": "balanced", "max_model_calls": 1})
+        with patch.object(self.engine, "_start"):
+            run = self.engine.create(payload, "owner-a")
+        provider_type = run["provider_type"]
+        first = ResearchEngine._reserve_model_call(run["id"], 1, "math", "agent", "ollama", provider_type, "test-model")
+        self.assertIsNotNone(first)
+        with self.assertRaises(ModelProviderError) as error:
+            ResearchEngine._reserve_model_call(run["id"], 1, "critic", "agent", "ollama", provider_type, "test-model")
+        self.assertEqual(error.exception.reason_code, "CALL_BUDGET_EXHAUSTED")
+        detail = self.engine.get_detail(run["id"], "owner-a")
+        self.assertEqual(detail["resource_usage"]["model_calls"], 1)
+        self.assertEqual(detail["resource_usage"]["successful_calls"], 0)
+        self.assertEqual(detail["resource_usage"]["failed_calls"], 0)
+        self.assertEqual(detail["resource_usage"]["model_breakdown"][0]["pending_calls"], 1)
+
+    def test_runtime_usage_survives_pause_and_resume(self):
+        with patch.object(self.engine, "_start"):
+            run = self.engine.create(CreateResearchRun(title="累计运行时长", question="检查续跑资源统计。", agents=["math", "critic"],
+                max_rounds=0), "owner-a")
+            ResearchEngine._set_status(run["id"], "paused")
+            with research.connection() as conn:
+                conn.execute("UPDATE research_runs SET runtime_seconds_total=125 WHERE id=?", (run["id"],))
+            resumed = self.engine.control(run["id"], "owner-a", "resume")
+        self.assertEqual(resumed["status"], "running")
+        detail = self.engine.get_detail(run["id"], "owner-a")
+        self.assertGreaterEqual(detail["resource_usage"]["runtime_seconds"], 125)
 
     def test_output_evidence_is_normalized_and_linked_to_agent_task(self):
         payload = CreateResearchRun(
@@ -138,7 +184,7 @@ class ResearchPersistenceTests(unittest.TestCase):
             run = self.engine.create(payload, "owner-a")
 
         prompts = []
-        def answer(system, prompt, temperature=0.35, max_tokens=2048):
+        def answer(system, prompt, temperature=0.35, max_tokens=2048, **kwargs):
             prompts.append(prompt)
             return f"完成：{system[:20]}"
 

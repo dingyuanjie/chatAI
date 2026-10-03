@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 from app.research import ResearchEngine
 from app.providers.openai_compatible import completion_token_limit
+from app.providers.openai_compatible import OpenAICompatibleChatModel
 
 
 class ResearchModelAdapterTests(unittest.TestCase):
@@ -76,6 +77,32 @@ class ResearchModelAdapterTests(unittest.TestCase):
         }):
             with self.assertRaisesRegex(RuntimeError, "上下文窗口限制"):
                 ResearchEngine._call_model("system", "long prompt")
+
+    @patch("app.providers.openai_compatible.httpx.post")
+    def test_remote_usage_is_normalized_and_priced_only_when_configured(self, post):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200,
+                      "prompt_tokens_details": {"cached_tokens": 500}}}
+        post.return_value = response
+        provider = OpenAICompatibleChatModel("https://api.deepseek.com", "deepseek-flash", "key", provider_type="REMOTE")
+        result = provider.generate("system", "prompt")
+        self.assertEqual(result.provider_type, "REMOTE")
+        self.assertEqual(result.usage.input_tokens, 1000)
+        self.assertEqual(result.usage.output_tokens, 200)
+        self.assertEqual(result.usage.cached_input_tokens, 500)
+        self.assertAlmostEqual(result.usage.estimated_cost, 0.000393)
+
+    @patch("app.providers.openai_compatible.httpx.post")
+    def test_unknown_remote_model_has_no_fabricated_cost(self, post):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}
+        post.return_value = response
+        provider = OpenAICompatibleChatModel("https://models.example/v1", "unpriced-model", "key", provider_type="REMOTE")
+        self.assertIsNone(provider.generate("s", "p").usage.estimated_cost)
 
     def test_synthesis_prompt_is_bounded_for_small_local_context(self):
         outputs = [f"专家{i}：\n" + ("[finding] 支持该推论但仍需检验 [W1]。" * 100) for i in range(6)]

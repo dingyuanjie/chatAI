@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -22,7 +22,17 @@ from app.agents.registry import AgentRegistry
 from app.agents.router import AgentRouter
 from app.agents.workflows import DEPTH_BUDGETS, WORKFLOWS
 from app.providers.openai_compatible import OpenAICompatibleChatModel
+from app.providers.models import ModelProviderError
+from app.providers.registry import model_provider_registry
+from app.model_settings import model_settings
 from app.retrieval.base import RAGStoreAdapter
+from app.continuous_research.continuation_judge import ResearchContinuationJudge
+from app.continuous_research.controller import ContinuousResearchController
+from app.continuous_research.models import ContinuousResearchConfig
+from app.continuous_research.loop_detector import ResearchLoopDetector
+from app.continuous_research.novelty_detector import NoveltyDetector
+from app.continuous_research.progress_tracker import ProgressTracker
+from app.continuous_research.resource_usage import ResearchResourceUsage
 
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -109,6 +119,11 @@ class CreateResearchRun(BaseModel):
     max_rounds: int = Field(default=5, ge=0, le=100)
     workflow_mode: str = Field(default="multidisciplinary", min_length=1, max_length=64)
     research_depth: str = Field(default="normal", min_length=1, max_length=16)
+    continuous_config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EmergencyStopRequest(BaseModel):
+    enabled: bool
 
 
 class PreviewRouteRequest(BaseModel):
@@ -196,17 +211,52 @@ class ResearchEngine:
                 conn.execute("ALTER TABLE research_runs ADD COLUMN route_reason TEXT NOT NULL DEFAULT ''")
             if "current_stage" not in run_columns:
                 conn.execute("ALTER TABLE research_runs ADD COLUMN current_stage TEXT NOT NULL DEFAULT 'queued'")
+            migrations = {
+                "continuous_config_json": "TEXT NOT NULL DEFAULT '{}'",
+                "started_at": "TEXT NOT NULL DEFAULT ''",
+                "consecutive_errors": "INTEGER NOT NULL DEFAULT 0",
+                "no_progress_cycles": "INTEGER NOT NULL DEFAULT 0",
+                "convergence_cycles": "INTEGER NOT NULL DEFAULT 0",
+                "escape_attempted": "INTEGER NOT NULL DEFAULT 0",
+                "session_summary_json": "TEXT NOT NULL DEFAULT '{}'",
+                "runtime_seconds_total": "REAL NOT NULL DEFAULT 0",
+                "provider_id": "TEXT NOT NULL DEFAULT ''",
+                "provider_type": "TEXT NOT NULL DEFAULT 'LOCAL'",
+                "model_name": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, declaration in migrations.items():
+                if column not in run_columns:
+                    conn.execute(f"ALTER TABLE research_runs ADD COLUMN {column} {declaration}")
+            conn.execute("UPDATE research_runs SET started_at=created_at WHERE started_at=''")
+            conn.execute("""CREATE TABLE IF NOT EXISTS research_cycle_metrics (
+                run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                cycle_no INTEGER NOT NULL, metrics_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY(run_id,cycle_no)
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS research_model_calls (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+                cycle_no INTEGER NOT NULL DEFAULT 0, agent_id TEXT NOT NULL DEFAULT '', purpose TEXT NOT NULL DEFAULT '',
+                provider_id TEXT NOT NULL, provider_type TEXT NOT NULL, model_name TEXT NOT NULL,
+                successful INTEGER NOT NULL, error_code TEXT NOT NULL DEFAULT '', retry_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER, estimated_cost REAL, currency TEXT,
+                duration_seconds REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_research_model_calls_run ON research_model_calls(run_id,cycle_no,created_at)")
+            conn.execute("CREATE TABLE IF NOT EXISTS research_control (id INTEGER PRIMARY KEY CHECK(id=1), emergency_stop INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '')")
+            conn.execute("INSERT OR IGNORE INTO research_control(id,emergency_stop,updated_at) VALUES(1,0,?)", (utc_now(),))
             evidence_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_evidence)").fetchall()}
             if "citation_label" not in evidence_columns:
                 conn.execute("ALTER TABLE research_evidence ADD COLUMN citation_label TEXT NOT NULL DEFAULT ''")
             # A process restart is a checkpoint, not a failed or lost run.
-            conn.execute("UPDATE research_runs SET status='paused', updated_at=? WHERE status IN ('running','pause_requested','cancel_requested')", (utc_now(),))
+            conn.execute("UPDATE research_runs SET status='paused', updated_at=? WHERE status IN ('planning','running','converging','pause_requested','cancel_requested')", (utc_now(),))
             conn.commit()
 
     @staticmethod
     def _run_dict(row: sqlite3.Row) -> Dict[str, Any]:
         value = dict(row)
         value["agents"] = json.loads(value.pop("agents_json"))
+        value["continuous_config"] = json.loads(value.get("continuous_config_json") or "{}")
+        value["session_summary"] = json.loads(value.get("session_summary_json") or "{}")
         value["continuous"] = value["max_rounds"] == 0
         value["max_rounds"] = None if value["max_rounds"] == 0 else value["max_rounds"]
         return value
@@ -236,6 +286,8 @@ class ResearchEngine:
                 FROM research_claim_evidence ce JOIN research_evidence e ON e.id=ce.evidence_id
                 JOIN research_claims c ON c.id=ce.claim_id WHERE c.run_id=? ORDER BY e.title""", (run_id,)).fetchall()
             memory = conn.execute("SELECT * FROM research_memory WHERE run_id=? ORDER BY round_no", (run_id,)).fetchall()
+            cycle_metrics = conn.execute("SELECT cycle_no,metrics_json,created_at FROM research_cycle_metrics WHERE run_id=? ORDER BY cycle_no DESC LIMIT 12", (run_id,)).fetchall()
+            all_cycle_metric_rows = conn.execute("SELECT metrics_json FROM research_cycle_metrics WHERE run_id=? ORDER BY cycle_no", (run_id,)).fetchall()
             related_memory = conn.execute("""SELECT m.id,m.title,m.question,m.round_no,m.summary,m.claims_json,m.open_questions_json,
                 ml.relevance,ml.run_id,ml.round_no AS linked_round FROM research_memory_links ml
                 JOIN research_memory m ON m.id=ml.memory_id WHERE ml.run_id=? ORDER BY ml.round_no,ml.relevance DESC""", (run_id,)).fetchall()
@@ -251,6 +303,12 @@ class ResearchEngine:
                             "open_questions": json.loads(item["open_questions_json"])} for item in memory]
         data["related_memory"] = [{**dict(item), "claims": json.loads(item["claims_json"]),
                                    "open_questions": json.loads(item["open_questions_json"])} for item in related_memory]
+        data["cycle_metrics"] = [{**json.loads(item["metrics_json"]), "cycle_id": item["cycle_no"], "timestamp": item["created_at"]}
+                                  for item in reversed(cycle_metrics)]
+        _, effective_provider_type = self._effective_resource_policy(row["id"], ContinuousResearchConfig.from_dict(data["continuous_config"], row["provider_type"]), row["provider_type"])
+        total_information_gain = sum(float(json.loads(item[0]).get("information_gain_score", 0)) for item in all_cycle_metric_rows)
+        data["resource_usage"] = self._resource_usage(row["id"], effective_provider_type, row["started_at"] or row["created_at"],
+            int(row["current_round"]), total_information_gain)
         return data
 
     def get_graph(self, run_id: str, owner_id: str, limit_rounds: int = 50) -> Dict[str, Any]:
@@ -369,6 +427,258 @@ class ResearchEngine:
                  json.dumps(open_questions, ensure_ascii=False), utc_now()))
             conn.commit()
 
+    def _record_cycle_metrics(self, run_id: str, cycle_no: int, summary: str,
+                              config: ContinuousResearchConfig) -> Dict[str, Any]:
+        store = getattr(self.retriever, "store", None)
+        embed_method = getattr(store, "_embed", None)
+        embed = (lambda texts: embed_method(texts)) if callable(embed_method) else None
+        with connection() as conn:
+            claims = [dict(row) for row in conn.execute("SELECT claim_text,claim_type,agent_id FROM research_claims WHERE run_id=? AND round_no=?", (run_id, cycle_no))]
+            prior_claims = [dict(row) for row in conn.execute("SELECT claim_text,claim_type,agent_id FROM research_claims WHERE run_id=? AND round_no>=? AND round_no<? ORDER BY round_no DESC LIMIT 500", (run_id, max(1, cycle_no - config.loop_detection_window + 1), cycle_no))]
+            evidence = [dict(row) for row in conn.execute("SELECT url,title FROM research_evidence WHERE run_id=? AND round_no=?", (run_id, cycle_no))]
+            prior_urls = {row[0] for row in conn.execute("SELECT DISTINCT url FROM research_evidence WHERE run_id=? AND round_no<?", (run_id, cycle_no))}
+            connections = conn.execute("SELECT COUNT(*) FROM research_output_evidence oe JOIN research_outputs o ON o.id=oe.output_id WHERE o.run_id=? AND o.round_no=?", (run_id, cycle_no)).fetchone()[0]
+            completed = conn.execute("SELECT COUNT(*) FROM research_tasks WHERE run_id=? AND round_no=? AND status='completed'", (run_id, cycle_no)).fetchone()[0]
+            tasks_created = conn.execute("SELECT COUNT(*) FROM research_tasks WHERE run_id=? AND round_no=?", (run_id, cycle_no)).fetchone()[0]
+            executable = conn.execute("SELECT COUNT(*) FROM research_tasks WHERE run_id=? AND round_no=? AND status IN ('queued','running')", (run_id, cycle_no)).fetchone()[0]
+            open_rows = conn.execute("SELECT claim_text FROM research_claims WHERE run_id=? AND round_no=? AND claim_type IN ('hypothesis','prediction','limitation','counterevidence')", (run_id, cycle_no)).fetchall()
+            old_open = [str(row[0]) for row in conn.execute("SELECT open_questions_json FROM research_memory WHERE run_id=? AND round_no<? ORDER BY round_no DESC LIMIT 1", (run_id, cycle_no)).fetchall()]
+            output_agents = [row[0] for row in conn.execute("SELECT agent_id FROM research_outputs WHERE run_id=? AND round_no=? AND status='completed'", (run_id, cycle_no)).fetchall()]
+            past_cycles = [json.loads(row[0]) for row in conn.execute("SELECT metrics_json FROM research_cycle_metrics WHERE run_id=? ORDER BY cycle_no DESC LIMIT ?", (run_id, config.loop_detection_window - 1)).fetchall()]
+        blocked = [{"question": str(row[0]), "reason": ProgressTracker.blocked_reason(str(row[0]))}
+                   for row in open_rows if ProgressTracker.blocked_reason(str(row[0]))]
+        resolved_terms = ("已解决", "得到回答", "已回答", "被证伪", "已排除")
+        resolved_questions = min(len(json.loads(old_open[0])) if old_open else 0,
+                                 sum(1 for term in resolved_terms if term in summary))
+        metrics = ProgressTracker(config.weights, config.duplicate_similarity_threshold, embed).measure(
+            claims, evidence, prior_claims, prior_urls, connections, resolved_questions)
+        metrics.update({"cycle_id": cycle_no, "timestamp": utc_now(), "agents_used": sorted(set(output_agents)),
+                        "tasks_completed": int(completed), "tasks_created": int(tasks_created),
+                        "blocked_questions": blocked, "executable_tasks": int(executable),
+                        "signature": ProgressTracker.signature(claims, summary)})
+        loop = ResearchLoopDetector(config.loop_threshold, config.loop_detection_window)
+        metrics["loop_score"] = round(loop.score([*reversed(past_cycles), metrics]), 3)
+        run = self._state(run_id)
+        if run:
+            _, effective_provider_type = self._effective_resource_policy(run_id, ContinuousResearchConfig.from_dict(json.loads(run["continuous_config_json"] or "{}"), run["provider_type"]), run["provider_type"])
+            with connection() as conn:
+                all_metrics = [json.loads(row[0]) for row in conn.execute("SELECT metrics_json FROM research_cycle_metrics WHERE run_id=?", (run_id,)).fetchall()]
+            metrics["resource_usage"] = self._resource_usage(run_id, effective_provider_type, run["started_at"] or run["created_at"], cycle_no,
+                sum(float(item.get("information_gain_score", 0)) for item in all_metrics) + float(metrics.get("information_gain_score", 0)))
+        with connection() as conn:
+            conn.execute("INSERT OR REPLACE INTO research_cycle_metrics(run_id,cycle_no,metrics_json,created_at) VALUES(?,?,?,?)",
+                         (run_id, cycle_no, json.dumps(metrics, ensure_ascii=False), metrics["timestamp"]))
+        return metrics
+
+    @staticmethod
+    def _latest_model_error(run_id: str) -> Optional[Dict[str, Any]]:
+        with connection() as conn:
+            row = conn.execute("SELECT successful,error_code,provider_type,provider_id,model_name,created_at FROM research_model_calls WHERE run_id=? ORDER BY created_at DESC LIMIT 1", (run_id,)).fetchone()
+        return dict(row) if row and not row["successful"] and row["error_code"] else None
+
+    @staticmethod
+    def _effective_resource_policy(run_id: str, config: ContinuousResearchConfig, default_type: str):
+        with connection() as conn:
+            remote_used = conn.execute("SELECT 1 FROM research_model_calls WHERE run_id=? AND provider_type='REMOTE' LIMIT 1", (run_id,)).fetchone()
+        if not remote_used or default_type.upper() == "REMOTE":
+            return config, default_type.upper()
+        values = config.to_dict()
+        values.update({"provider_type": "REMOTE", "max_model_calls": min(config.max_model_calls or 100, 100),
+                       "max_session_tokens": min(config.max_session_tokens or 500_000, 500_000),
+                       "max_session_cost": config.max_session_cost if config.max_session_cost is not None else 5.0})
+        return ContinuousResearchConfig.from_dict(values, "REMOTE"), "REMOTE"
+
+    @staticmethod
+    def _emergency_stop_requested() -> bool:
+        with connection() as conn:
+            row = conn.execute("SELECT emergency_stop FROM research_control WHERE id=1").fetchone()
+        return bool(row and row[0])
+
+    def set_emergency_stop(self, enabled: bool):
+        now = utc_now()
+        with connection() as conn:
+            conn.execute("UPDATE research_control SET emergency_stop=?,updated_at=? WHERE id=1", (int(enabled), now))
+        return {"enabled": enabled, "updated_at": now}
+
+    @staticmethod
+    def emergency_stop_status() -> Dict[str, Any]:
+        with connection() as conn:
+            row = conn.execute("SELECT emergency_stop,updated_at FROM research_control WHERE id=1").fetchone()
+        return {"enabled": bool(row[0]), "updated_at": row[1]} if row else {"enabled": False, "updated_at": ""}
+
+    def _session_summary(self, run: sqlite3.Row, metrics_rows: List[Dict[str, Any]], reason: str) -> Dict[str, Any]:
+        self._checkpoint_runtime(run["id"])
+        with connection() as conn:
+            metrics_rows = [json.loads(row[0]) for row in conn.execute("SELECT metrics_json FROM research_cycle_metrics WHERE run_id=? ORDER BY cycle_no", (run["id"],)).fetchall()]
+        totals: Dict[str, int] = {}
+        for item in metrics_rows:
+            for key in ("new_claims", "new_evidence", "new_counterexamples", "new_hypotheses", "new_predictions", "new_experiments", "new_mathematical_models", "resolved_questions"):
+                totals[key] = totals.get(key, 0) + int(item.get(key, 0))
+        blocked: Dict[str, int] = {}
+        for cycle in metrics_rows:
+            for item in cycle.get("blocked_questions", []):
+                code = item.get("reason", "INSUFFICIENT_EVIDENCE")
+                blocked[code] = blocked.get(code, 0) + 1
+        _, effective_provider_type = self._effective_resource_policy(run["id"], ContinuousResearchConfig.from_dict(json.loads(run["continuous_config_json"] or "{}"), run["provider_type"]), run["provider_type"])
+        resources = self._resource_usage(run["id"], effective_provider_type, run["started_at"] or run["created_at"],
+                                        int(run["current_round"]), sum(float(item.get("information_gain_score", 0)) for item in metrics_rows))
+        elapsed = max(0, int(resources["runtime_seconds"] // 60))
+        open_problems = list(dict.fromkeys(str(question.get("question", "")) for cycle in metrics_rows
+            for question in cycle.get("blocked_questions", []) if question.get("question")))[:30]
+        with connection() as conn:
+            memory_rows = conn.execute("SELECT open_questions_json FROM research_memory WHERE run_id=? ORDER BY round_no DESC LIMIT 12", (run["id"],)).fetchall()
+            claims = conn.execute("SELECT claim_text,claim_type FROM research_claims WHERE run_id=? ORDER BY round_no DESC,created_at DESC LIMIT 500", (run["id"],)).fetchall()
+        for memory_row in memory_rows:
+            try:
+                for item in json.loads(memory_row[0] or "[]"):
+                    text = str(item.get("text", "")).strip()
+                    if text and text not in open_problems:
+                        open_problems.append(text)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if len(open_problems) >= 30:
+                break
+        return {"provider_id": run["provider_id"], "provider_type": run["provider_type"], "model_name": run["model_name"],
+                "duration_minutes": elapsed, "cycles": int(run["current_round"]),
+                "agent_calls": resources["model_calls"], "resource_usage": resources,
+                "totals": totals, "blocked_questions": blocked, "open_problems": open_problems,
+                "key_findings": [row["claim_text"] for row in claims if row["claim_type"] == "finding"][:30],
+                "counterexamples": [row["claim_text"] for row in claims if row["claim_type"] == "counterevidence"][:30],
+                "hypotheses": [row["claim_text"] for row in claims if row["claim_type"] == "hypothesis"][:30],
+                "experiments": [row["claim_text"] for row in claims if any(term in row["claim_text"] for term in ("实验", "experiment"))][:30],
+                "mathematical_models": [row["claim_text"] for row in claims if any(term in row["claim_text"] for term in ("方程", "数学模型", "形式化模型", "数学表达"))][:30],
+                "latest_synthesis": str(run["summary"] or "")[:6000],
+                "reason": reason, "resume_conditions": ["添加新的知识库文档", "补充实验或观测数据", "提出新的研究方向", "更换或升级模型", "用户手动恢复"]}
+
+    def _final_escape_cycle(self, run: sqlite3.Row, cycle_no: int, metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+        context = json.dumps({"question": run["question"], "title": run["title"], "recent_cycles": metrics[-5:]}, ensure_ascii=False)[:9000]
+        roles = [
+            ("escape_planner", "Research Planner", AGENTS["foundations"].system_prompt, "提出尚未执行的高价值研究路径和可执行下一步。"),
+            ("escape_skeptic", "Skeptic / Counterexample Agent", AGENTS["critic"].system_prompt, "寻找最强反例、替代理论和能推翻当前判断的观察。"),
+            ("escape_open_questions", "Open Problems Agent", AGENTS["experimental_methods"].system_prompt, "提出仍未解决且依赖实验、外部数据或新模型的关键问题。"),
+        ]
+        answers = []
+        for agent_id, label, system, instruction in roles:
+            content = self._call_model(system + "请严格区分证据与推测，输出简短 Markdown。", f"研究进入休眠前的最终逃逸探索。\n{context}\n\n{instruction}", 0.2, 1000,
+                run_id=run["id"], cycle_no=cycle_no, agent_id=agent_id, purpose="final_escape")
+            self._save_output(run["id"], cycle_no, agent_id, content, [], "completed")
+            answers.append(f"## {label}\n{content}")
+        merged = "\n\n".join(answers)
+        meta_prompt = ("基于这些规划、反例审查与开放问题分析，判断是否有真正不同于历史内容的高价值方向。只返回 JSON："
+            '{"new_direction_found":true/false,"reason":"...","next_question":"..."}\n' + merged[:9000])
+        meta = self._call_model(AGENTS["synthesis"].system_prompt, meta_prompt, 0.1, 700,
+            run_id=run["id"], cycle_no=cycle_no, agent_id="escape_meta_research", purpose="final_escape_judge")
+        self._save_output(run["id"], cycle_no, "escape_meta_research", meta, [], "completed")
+        match = re.search(r"\{.*\}", meta, re.DOTALL)
+        try:
+            result = json.loads(match.group(0)) if match else {}
+        except (ValueError, TypeError):
+            result = {}
+        next_question = str(result.get("next_question", "")).strip()
+        old_questions = [str(item.get("signature", "")) for item in metrics[-5:]]
+        novelty = NoveltyDetector(0.92).max_similarity(next_question, old_questions)
+        found = bool(result.get("new_direction_found")) and len(next_question) >= 12 and novelty < 0.92
+        return {"new_direction_found": found, "reason": str(result.get("reason", ""))[:500],
+                "next_question": next_question, "output": merged + "\n\n## Meta Research\n" + meta}
+
+    def _apply_continuous_policy(self, run: sqlite3.Row, metrics: Dict[str, Any]) -> str:
+        """Apply automatic continuation/stop rules after a completed continuous cycle."""
+        config = ContinuousResearchConfig.from_dict(json.loads(run["continuous_config_json"] or "{}"))
+        if run["max_rounds"] != 0:
+            return "running"
+        started = run["started_at"] or run["created_at"]
+        elapsed = self._runtime_seconds(run["id"]) / 60
+        with connection() as conn:
+            current = conn.execute("SELECT * FROM research_runs WHERE id=?", (run["id"],)).fetchone()
+            rows = conn.execute("SELECT metrics_json FROM research_cycle_metrics WHERE run_id=? ORDER BY cycle_no DESC LIMIT 12", (run["id"],)).fetchall()
+        if not current:
+            return "stopped"
+        config, effective_provider_type = self._effective_resource_policy(current["id"], config, current["provider_type"])
+        history = [json.loads(row[0]) for row in reversed(rows)]
+        no_progress = ProgressTracker.advance_no_progress(int(current["no_progress_cycles"]),
+            float(metrics.get("information_gain_score", 0)), config.min_information_gain)
+        was_converging = current["status"] == "converging"
+        convergence_cycles = int(current["convergence_cycles"]) + 1 if was_converging else 0
+        if float(metrics.get("information_gain_score", 0)) >= config.min_information_gain:
+            convergence_cycles = 0
+        effective_config, effective_provider_type = self._effective_resource_policy(current["id"], config, current["provider_type"])
+        resource_usage = self._resource_usage(current["id"], effective_provider_type, started, int(current["current_round"]),
+            sum(float(item.get("information_gain_score", 0)) for item in history))
+        latest_error = self._latest_model_error(current["id"])
+        pre_decision = ContinuousResearchController(effective_config).decide(state=current["status"], elapsed_minutes=elapsed,
+            cycles=int(current["current_round"]), consecutive_errors=int(current["consecutive_errors"]),
+            no_progress_cycles=no_progress, convergence_cycles=convergence_cycles, recent_metrics=history,
+            emergency_stop=self._emergency_stop_requested(), provider_type=effective_provider_type,
+            resource_usage=resource_usage, latest_error=latest_error)
+        non_advisory_stops = {"MANUAL_STOP", "EMERGENCY_STOP", "MAX_RUNTIME", "MAX_CYCLES", "TOO_MANY_ERRORS",
+            "MAX_CONSECUTIVE_ERRORS", "TOKEN_BUDGET_EXHAUSTED", "COST_BUDGET_EXHAUSTED", "CALL_BUDGET_EXHAUSTED",
+            "API_QUOTA_EXHAUSTED", "API_RATE_LIMITED", "API_AUTH_FAILED", "API_SERVER_ERROR", "API_NETWORK_ERROR",
+            "MODEL_UNAVAILABLE", "LOCAL_RESOURCE_ERROR"}
+        if pre_decision.reason_code in non_advisory_stops and (pre_decision.should_stop or pre_decision.should_sleep):
+            summary = self._session_summary(current, history, pre_decision.reason)
+            summary["reason_code"] = pre_decision.reason_code
+            with connection() as conn:
+                conn.execute("UPDATE research_runs SET status=?,error=?,no_progress_cycles=?,convergence_cycles=?,session_summary_json=?,updated_at=? WHERE id=?",
+                    (pre_decision.next_state, pre_decision.reason, no_progress, convergence_cycles,
+                     json.dumps(summary, ensure_ascii=False), utc_now(), current["id"]))
+            return pre_decision.next_state
+        judge = None
+        if config.judge_enabled and (no_progress >= config.no_progress_patience - 1 or was_converging):
+            try:
+                judge_call = lambda system, prompt, temperature, max_tokens: self._call_model(system, prompt, temperature, max_tokens,
+                    run_id=current["id"], cycle_no=int(current["current_round"]), agent_id="continuation_judge", purpose="continuation_judge")
+                judge = ResearchContinuationJudge.evaluate({"question": current["question"], "round": current["current_round"],
+                    "recent_metrics": history[-5:], "recent_summary": current["summary"][-1800:]}, judge_call)
+                metrics["continuation_judge"] = judge
+                with connection() as conn:
+                    conn.execute("UPDATE research_cycle_metrics SET metrics_json=? WHERE run_id=? AND cycle_no=?",
+                                 (json.dumps(metrics, ensure_ascii=False), current["id"], current["current_round"]))
+            except Exception:
+                judge = None
+        decision = ContinuousResearchController(effective_config).decide(state=current["status"], elapsed_minutes=elapsed,
+            cycles=int(current["current_round"]), consecutive_errors=int(current["consecutive_errors"]),
+            no_progress_cycles=no_progress, convergence_cycles=convergence_cycles, recent_metrics=history,
+            emergency_stop=self._emergency_stop_requested(), judge=judge, provider_type=effective_provider_type,
+            resource_usage=resource_usage, latest_error=latest_error)
+        now = utc_now()
+        if decision.should_stop:
+            with connection() as conn:
+                conn.execute("UPDATE research_runs SET status=?,error=?,no_progress_cycles=?,convergence_cycles=?,session_summary_json=?,updated_at=? WHERE id=?",
+                    (decision.next_state, decision.reason, no_progress, convergence_cycles,
+                     json.dumps(self._session_summary(current, history, decision.reason), ensure_ascii=False), now, current["id"]))
+            return decision.next_state
+        if decision.next_state == "running" and decision.reason_code in ("NEW_PROGRESS", "JUDGE_REPLAN"):
+            no_progress = 0
+            convergence_cycles = 0
+        soft_sleep_reasons = {"NO_INFORMATION_GAIN", "RESEARCH_CONVERGED", "LOOP_DETECTED", "NO_EXECUTABLE_TASKS", "ALL_TASKS_BLOCKED"}
+        if decision.should_sleep and decision.reason_code in soft_sleep_reasons and config.final_escape_cycle_enabled and not current["escape_attempted"]:
+            with connection() as conn:
+                conn.execute("UPDATE research_runs SET escape_attempted=1,updated_at=? WHERE id=?", (now, current["id"]))
+            escape = {"new_direction_found": False, "reason": "最终逃逸探索未能完成", "next_question": ""}
+            try:
+                escape = self._final_escape_cycle(current, int(current["current_round"]), history)
+            except Exception as exc:
+                escape["reason"] = str(exc)[:400]
+            if escape.get("new_direction_found"):
+                metrics["escape_cycle"] = {key: escape.get(key) for key in ("new_direction_found", "reason", "next_question")}
+                with connection() as conn:
+                    conn.execute("UPDATE research_cycle_metrics SET metrics_json=? WHERE run_id=? AND cycle_no=?", (json.dumps(metrics, ensure_ascii=False), current["id"], current["current_round"]))
+                    conn.execute("UPDATE research_runs SET status='running',error='最终反例探索找到新方向，继续研究',no_progress_cycles=0,convergence_cycles=0,escape_attempted=0,updated_at=? WHERE id=?", (utc_now(), current["id"]))
+                return "running"
+        if decision.should_sleep:
+            reason = decision.reason
+            with connection() as conn:
+                latest = conn.execute("SELECT * FROM research_runs WHERE id=?", (current["id"],)).fetchone()
+                summary = self._session_summary(latest, history, reason)
+                summary["final_escape"] = metrics.get("escape_cycle", {"attempted": bool(current["escape_attempted"] or config.final_escape_cycle_enabled)})
+                conn.execute("UPDATE research_runs SET status='sleeping',error=?,no_progress_cycles=?,convergence_cycles=?,session_summary_json=?,updated_at=? WHERE id=?",
+                    (reason, no_progress, convergence_cycles, json.dumps(summary, ensure_ascii=False), utc_now(), current["id"]))
+            return "sleeping"
+        with connection() as conn:
+            conn.execute("UPDATE research_runs SET status=?,error=?,no_progress_cycles=?,convergence_cycles=?,consecutive_errors=0,updated_at=? WHERE id=?",
+                (decision.next_state, decision.reason, no_progress, convergence_cycles, now, current["id"]))
+        return decision.next_state
+
     def create(self, payload: CreateResearchRun, owner_id: str) -> Dict[str, Any]:
         try:
             route = AGENT_ROUTER.route(payload.question, payload.workflow_mode, payload.research_depth, payload.agents)
@@ -376,11 +686,17 @@ class ResearchEngine:
             raise HTTPException(400, str(exc)) from exc
         agents = route.agent_ids
         run_id, now = uuid.uuid4().hex, utc_now()
+        provider_info = model_provider_registry.describe_research_provider()
+        provider_type = str(provider_info["provider_type"])
+        continuous_config = ContinuousResearchConfig.from_dict(payload.continuous_config, provider_type).to_dict()
         title = payload.title.strip() or payload.question.strip().splitlines()[0][:100]
         with connection() as conn:
             conn.execute("""INSERT INTO research_runs(
-                id,owner_id,title,question,agents_json,max_rounds,status,workflow_mode,research_depth,route_reason,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (run_id, owner_id, title, payload.question.strip(), json.dumps(agents), payload.max_rounds, "running", route.workflow_mode, route.research_depth, route.route_reason, now, now))
+                id,owner_id,title,question,agents_json,max_rounds,status,workflow_mode,research_depth,route_reason,created_at,updated_at,
+                continuous_config_json,started_at,provider_id,provider_type,model_name
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (run_id, owner_id, title, payload.question.strip(), json.dumps(agents), payload.max_rounds,
+                "planning", route.workflow_mode, route.research_depth, route.route_reason, now, now, json.dumps(continuous_config), now,
+                provider_info["provider_id"], provider_type, provider_info["model_name"]))
             conn.commit()
         self._start(run_id)
         return self._run_dict(self._get_row(run_id, owner_id))
@@ -400,11 +716,11 @@ class ResearchEngine:
         with connection() as conn:
             row = conn.execute("SELECT status,current_round FROM research_runs WHERE id=?", (run_id,)).fetchone()
             status = row["status"]
-            if action == "pause" and status in ("running", "queued"):
+            if action == "pause" and status in ("planning", "running", "converging", "queued"):
                 conn.execute("UPDATE research_runs SET status='pause_requested', updated_at=? WHERE id=?", (utc_now(), run_id))
-            elif action == "stop" and status in ("running", "queued", "pause_requested"):
+            elif action == "stop" and status in ("planning", "running", "converging", "queued", "pause_requested"):
                 conn.execute("UPDATE research_runs SET status='cancel_requested', updated_at=? WHERE id=?", (utc_now(), run_id))
-            elif action == "resume" and status in ("paused", "failed", "cancelled"):
+            elif action == "resume" and status in ("paused", "failed", "cancelled", "sleeping", "stopped"):
                 # A failed synthesis is stored after current_round advances.
                 # Roll that checkpoint back one round so resume retries the
                 # saved synthesis instead of silently skipping it.
@@ -414,7 +730,7 @@ class ResearchEngine:
                 ).fetchone()
                 if failed_synthesis and row["current_round"] > 0:
                     conn.execute("UPDATE research_runs SET current_round=current_round-1 WHERE id=?", (run_id,))
-                conn.execute("UPDATE research_runs SET status='running', error='', updated_at=? WHERE id=?", (utc_now(), run_id))
+                conn.execute("UPDATE research_runs SET status='running', error='', no_progress_cycles=0, convergence_cycles=0, consecutive_errors=0, escape_attempted=0, started_at=?, updated_at=? WHERE id=?", (utc_now(), utc_now(), run_id))
                 conn.commit()
                 self._start(run_id)
                 return self._run_dict(self._get_row(run_id, owner_id))
@@ -434,6 +750,8 @@ class ResearchEngine:
 
     @staticmethod
     def _task_stage(agent_id: str) -> str:
+        if agent_id.startswith("escape_"):
+            return "escape"
         if agent_id == "retrieval":
             return "retrieval"
         if agent_id == "debate_critic":
@@ -459,7 +777,8 @@ class ResearchEngine:
     def _execute_agent(self, run_id: str, round_no: int, agent_id: str, system: str, prompt: str,
                        temperature: float, max_tokens: int) -> str:
         self._set_task(run_id, round_no, agent_id, "running")
-        return self._call_model(system, prompt, temperature, max_tokens)
+        return self._call_model(system, prompt, temperature, max_tokens, run_id=run_id, cycle_no=round_no,
+                                agent_id=agent_id, purpose="agent")
 
     @staticmethod
     def _source_type(source: Dict[str, Any]) -> str:
@@ -509,7 +828,7 @@ class ResearchEngine:
             conn.execute("""INSERT INTO research_outputs(id,run_id,round_no,agent_id,agent_name,status,content,sources_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,round_no,agent_id) DO UPDATE SET
                 status=excluded.status,content=excluded.content,sources_json=excluded.sources_json,created_at=excluded.created_at""",
-                (output_id, run_id, round_no, agent_id, AGENTS[agent_id].name, status, content, json.dumps(sources, ensure_ascii=False), now))
+                (output_id, run_id, round_no, agent_id, AGENTS[agent_id].name if agent_id in AGENTS else agent_id.replace("_", " ").title(), status, content, json.dumps(sources, ensure_ascii=False), now))
             saved = conn.execute("SELECT id FROM research_outputs WHERE run_id=? AND round_no=? AND agent_id=?", (run_id, round_no, agent_id)).fetchone()
             output_id = saved["id"]
             evidence_by_label: Dict[str, str] = {}
@@ -564,14 +883,149 @@ class ResearchEngine:
         return "\n\n".join(parts)[:3600] if parts else "本轮没有检索到可用外部或本地资料。请谨慎说明证据限制。"
 
     @staticmethod
-    def _call_model(system: str, prompt: str, temperature: float = 0.35, max_tokens: int = 2048) -> str:
-        # The adapter keeps profile limits for local Ollama, and raises the
-        # per-call ceiling for hosted reasoning models whose thinking tokens
-        # share the same completion budget as the visible response.
-        response = OpenAICompatibleChatModel.from_environment().generate(
-            system, prompt, temperature=temperature, max_tokens=max_tokens,
-        )
-        return response.text
+    def _reserve_model_call(run_id: Optional[str], cycle_no: Optional[int], agent_id: str, purpose: str,
+                            provider_id: str, provider_type: str, model_name: str) -> Optional[str]:
+        if not run_id:
+            return None
+        call_id = uuid.uuid4().hex
+        with connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute("SELECT max_rounds,provider_type,continuous_config_json FROM research_runs WHERE id=?", (run_id,)).fetchone()
+            if run and int(run["max_rounds"]) == 0:
+                config = ContinuousResearchConfig.from_dict(json.loads(run["continuous_config_json"] or "{}"), run["provider_type"])
+                remote_used = provider_type.upper() == "REMOTE" or str(run["provider_type"]).upper() == "REMOTE" or bool(conn.execute(
+                    "SELECT 1 FROM research_model_calls WHERE run_id=? AND provider_type='REMOTE' LIMIT 1", (run_id,)).fetchone())
+                if remote_used and str(run["provider_type"]).upper() != "REMOTE":
+                    max_calls = min(config.max_model_calls or 100, 100)
+                elif remote_used:
+                    max_calls = config.max_model_calls or 100
+                else:
+                    max_calls = config.max_model_calls
+                call_count = int(conn.execute("SELECT COUNT(*) FROM research_model_calls WHERE run_id=?", (run_id,)).fetchone()[0])
+                if max_calls is not None and call_count >= max_calls:
+                    raise ModelProviderError("达到模型调用预算，停止发起新的模型请求", "CALL_BUDGET_EXHAUSTED")
+            retry_count = 0
+            if cycle_no and agent_id:
+                task = conn.execute("SELECT attempt FROM research_tasks WHERE run_id=? AND round_no=? AND agent_id=?", (run_id, cycle_no, agent_id)).fetchone()
+                retry_count = max(0, int(task[0]) - 1) if task else 0
+            conn.execute("""INSERT INTO research_model_calls(id,run_id,cycle_no,agent_id,purpose,provider_id,provider_type,model_name,
+                successful,error_code,retry_count,duration_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (call_id, run_id, int(cycle_no or 0), agent_id, purpose, provider_id, provider_type, model_name,
+                 -1, "", retry_count, 0.0, utc_now()))
+        return call_id
+
+    @staticmethod
+    def _record_model_call(run_id: Optional[str], cycle_no: Optional[int], agent_id: str, purpose: str,
+                           provider_id: str, provider_type: str, model_name: str, successful: bool,
+                           error_code: str = "", usage: Any = None, duration_seconds: float = 0.0,
+                           call_id: Optional[str] = None):
+        if not run_id:
+            return
+        retry_count = 0
+        if cycle_no and agent_id:
+            with connection() as conn:
+                row = conn.execute("SELECT attempt FROM research_tasks WHERE run_id=? AND round_no=? AND agent_id=?", (run_id, cycle_no, agent_id)).fetchone()
+                retry_count = max(0, int(row[0]) - 1) if row else 0
+        with connection() as conn:
+            if call_id:
+                conn.execute("""UPDATE research_model_calls SET successful=?,error_code=?,input_tokens=?,output_tokens=?,total_tokens=?,
+                    estimated_cost=?,currency=?,duration_seconds=? WHERE id=?""", (int(successful), error_code,
+                    getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None), getattr(usage, "total_tokens", None),
+                    getattr(usage, "estimated_cost", None), getattr(usage, "currency", None), max(0.0, duration_seconds), call_id))
+            else:
+                conn.execute("""INSERT INTO research_model_calls(id,run_id,cycle_no,agent_id,purpose,provider_id,provider_type,model_name,
+                    successful,error_code,retry_count,input_tokens,output_tokens,total_tokens,estimated_cost,currency,duration_seconds,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (uuid.uuid4().hex, run_id, int(cycle_no or 0), agent_id, purpose,
+                    provider_id, provider_type, model_name, int(successful), error_code, retry_count,
+                    getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None), getattr(usage, "total_tokens", None),
+                    getattr(usage, "estimated_cost", None), getattr(usage, "currency", None), max(0.0, duration_seconds), utc_now()))
+
+    @staticmethod
+    def _resource_usage(run_id: str, provider_type: str, started_at: str, cycles: int, information_gain: float = 0.0) -> Dict[str, Any]:
+        with connection() as conn:
+            rows = conn.execute("SELECT * FROM research_model_calls WHERE run_id=? ORDER BY created_at", (run_id,)).fetchall()
+            run_runtime = conn.execute("SELECT runtime_seconds_total,status,started_at FROM research_runs WHERE id=?", (run_id,)).fetchone()
+        runtime_seconds = float(run_runtime["runtime_seconds_total"] or 0) if run_runtime else 0.0
+        if run_runtime and run_runtime["status"] in ("planning", "running", "converging", "pause_requested", "cancel_requested"):
+            runtime_start = run_runtime["started_at"] or started_at
+            runtime_seconds += max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(runtime_start)).total_seconds())
+        known_input = [int(row["input_tokens"]) for row in rows if row["input_tokens"] is not None]
+        known_output = [int(row["output_tokens"]) for row in rows if row["output_tokens"] is not None]
+        known_total = [int(row["total_tokens"]) for row in rows if row["total_tokens"] is not None]
+        cost_groups: Dict[str, float] = {}
+        for row in rows:
+            if row["estimated_cost"] is not None and row["currency"]:
+                currency = str(row["currency"]).upper()
+                cost_groups[currency] = cost_groups.get(currency, 0.0) + float(row["estimated_cost"])
+        usage = ResearchResourceUsage(runtime_seconds=runtime_seconds,
+            cycles=cycles, model_calls=len(rows), successful_calls=sum(1 for row in rows if int(row["successful"]) == 1),
+            failed_calls=sum(1 for row in rows if int(row["successful"]) == 0), retry_count=sum(int(row["retry_count"]) for row in rows),
+            input_tokens=sum(known_input) if known_input else None, output_tokens=sum(known_output) if known_output else None,
+            total_tokens=sum(known_total) if known_total else None,
+            estimated_cost=sum(cost_groups.values()) if len(cost_groups) == 1 else None,
+            currency=next(iter(cost_groups)) if len(cost_groups) == 1 else None,
+            information_gain=information_gain)
+        result = usage.to_dict()
+        result["provider_type"] = provider_type
+        result["research_efficiency"] = usage.research_efficiency(provider_type)
+        result["cost_by_currency"] = cost_groups
+        result["usage_reported_calls"] = sum(1 for row in rows if row["total_tokens"] is not None)
+        result["usage_unreported_calls"] = max(0, len(rows) - result["usage_reported_calls"])
+        breakdown: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            key = f"{row['provider_id']}|{row['model_name']}"
+            item = breakdown.setdefault(key, {"provider_id": row["provider_id"], "provider_type": row["provider_type"],
+                "model_name": row["model_name"], "model_calls": 0, "successful_calls": 0, "failed_calls": 0,
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost": None, "currency": row["currency"]})
+            item.setdefault("usage_reported_calls", 0)
+            item["model_calls"] += 1
+            item["successful_calls"] += int(row["successful"] == 1)
+            item["failed_calls"] += int(row["successful"] == 0)
+            item["pending_calls"] = item.get("pending_calls", 0) + int(row["successful"] == -1)
+            for field in ("input_tokens", "output_tokens", "total_tokens"):
+                if row[field] is not None:
+                    item[field] += int(row[field])
+            if row["total_tokens"] is not None:
+                item["usage_reported_calls"] += 1
+            if row["estimated_cost"] is not None:
+                item["estimated_cost"] = (item["estimated_cost"] or 0.0) + float(row["estimated_cost"])
+        for item in breakdown.values():
+            if not item["usage_reported_calls"]:
+                item["input_tokens"] = item["output_tokens"] = item["total_tokens"] = None
+        result["model_breakdown"] = list(breakdown.values())
+        result["pricing_available"] = bool(cost_groups)
+        return result
+
+    @staticmethod
+    def _call_model(system: str, prompt: str, temperature: float = 0.35, max_tokens: int = 2048,
+                    run_id: Optional[str] = None, cycle_no: Optional[int] = None,
+                    agent_id: str = "", purpose: str = "agent") -> str:
+        started = time.perf_counter()
+        provider_id, provider_type, model_name = "unknown", "LOCAL", ""
+        call_id = None
+        try:
+            settings = model_settings.get()
+            provider_type = "REMOTE" if settings.get("provider") == "remote" else "LOCAL"
+            provider_id = (urlparse(str(settings.get("remote_base_url", ""))).hostname or "openai_compatible") if provider_type == "REMOTE" else "ollama"
+            model_name = str((settings.get("remote_research_model") or settings.get("remote_chat_model")) if provider_type == "REMOTE" else settings.get("local_research_model", ""))
+            provider = model_provider_registry.create_research_provider()
+            provider_id, provider_type, model_name = provider.provider_id, provider.provider_type, provider.model
+            call_id = ResearchEngine._reserve_model_call(run_id, cycle_no, agent_id, purpose,
+                provider_id, provider_type, model_name)
+            response = provider.generate(system, prompt, temperature=temperature, max_tokens=max_tokens)
+            ResearchEngine._record_model_call(run_id, cycle_no, agent_id, purpose, response.provider_id or provider_id,
+                response.provider_type, response.model, True, usage=response.usage, duration_seconds=time.perf_counter() - started,
+                call_id=call_id)
+            return response.text
+        except Exception as exc:
+            if isinstance(exc, ModelProviderError):
+                error_code = exc.reason_code
+            else:
+                error_code = "LOCAL_MODEL_ERROR" if provider_type == "LOCAL" else "REMOTE_MODEL_ERROR"
+            if not (isinstance(exc, ModelProviderError) and exc.reason_code == "CALL_BUDGET_EXHAUSTED"):
+                ResearchEngine._record_model_call(run_id, cycle_no, agent_id, purpose, provider_id, provider_type,
+                    model_name, False, error_code=error_code, duration_seconds=time.perf_counter() - started, call_id=call_id)
+            raise
 
     def _agent_prompt(self, agent_id: str, run: sqlite3.Row, round_no: int, sources: str, previous: str) -> str:
         agent = AGENTS[agent_id]
@@ -623,8 +1077,31 @@ class ResearchEngine:
                     if run["status"] in ("cancel_requested", "cancelled"):
                         self._set_status(run_id, "cancelled")
                         return
-                    if run["status"] != "running":
+                    if run["status"] not in ("running", "planning", "converging"):
                         return
+                    if run["status"] == "planning":
+                        self._set_status(run_id, "running")
+                        run = self._state(run_id)
+                    if run["max_rounds"] == 0:
+                        saved_config = json.loads(run["continuous_config_json"] or "{}")
+                        hard_config = ContinuousResearchConfig.from_dict({**saved_config, "auto_sleep_enabled": False})
+                        hard_config, effective_provider_type = self._effective_resource_policy(run_id, hard_config, run["provider_type"])
+                        elapsed = self._runtime_seconds(run_id) / 60
+                        with connection() as conn:
+                            recent = [json.loads(row[0]) for row in reversed(conn.execute("SELECT metrics_json FROM research_cycle_metrics WHERE run_id=? ORDER BY cycle_no DESC LIMIT 12", (run_id,)).fetchall())]
+                        hard_decision = ContinuousResearchController(hard_config).decide(state=run["status"], elapsed_minutes=elapsed,
+                            cycles=int(run["current_round"]), consecutive_errors=int(run["consecutive_errors"]),
+                            no_progress_cycles=int(run["no_progress_cycles"]), convergence_cycles=int(run["convergence_cycles"]),
+                            recent_metrics=recent, emergency_stop=self._emergency_stop_requested(),
+                            provider_type=effective_provider_type,
+                            resource_usage=self._resource_usage(run_id, effective_provider_type, run["started_at"] or run["created_at"], int(run["current_round"])),
+                            latest_error=self._latest_model_error(run_id))
+                        if hard_decision.should_stop:
+                            with connection() as conn:
+                                conn.execute("UPDATE research_runs SET status=?,error=?,session_summary_json=?,updated_at=? WHERE id=?",
+                                    (hard_decision.next_state, hard_decision.reason,
+                                     json.dumps(self._session_summary(run, recent, hard_decision.reason), ensure_ascii=False), utc_now(), run_id))
+                            return
                     round_no = int(run["current_round"]) + 1
                     if run["max_rounds"] and round_no > run["max_rounds"]:
                         self._set_status(run_id, "completed")
@@ -651,6 +1128,11 @@ class ResearchEngine:
                     with connection() as conn:
                         prior = conn.execute("SELECT round_no,agent_name,status,content FROM research_outputs WHERE run_id=? AND round_no>=? ORDER BY round_no,created_at", (run_id, max(1, round_no - 1))).fetchall()
                     previous = f"上一轮综合摘要：\n{run['summary'][-700:]}\n\n" if run["summary"] else ""
+                    previous_session = json.loads(run["session_summary_json"] or "{}")
+                    if previous_session:
+                        previous += "恢复会话摘要（模型与研究状态分离，以下历史使用情况不限制本次模型选择）：\n"
+                        previous += json.dumps({"open_problems": previous_session.get("open_problems", []),
+                            "totals": previous_session.get("totals", {}), "reason": previous_session.get("reason", "")}, ensure_ascii=False)[:800] + "\n\n"
                     previous += "\n\n".join(f"第{item['round_no']}轮｜{item['agent_name']}\n{item['content'][:220]}" for item in prior[-6:])
                     related_memories = self._retrieve_memories(run["owner_id"], run_id, round_no, run["question"])
                     if related_memories:
@@ -703,10 +1185,31 @@ class ResearchEngine:
                         run_error = "本轮没有研究智能体成功完成。"
                         if first_failure:
                             run_error += f"首个模型错误：{first_failure[:420]}"
+                        config = ContinuousResearchConfig.from_dict(json.loads(run["continuous_config_json"] or "{}"))
+                        next_errors = int(run["consecutive_errors"] or 0) + 1
+                        effective_config, effective_provider_type = self._effective_resource_policy(run_id, config, run["provider_type"])
+                        decision = ContinuousResearchController(effective_config).decide(state=run["status"],
+                            elapsed_minutes=self._runtime_seconds(run_id) / 60,
+                            cycles=int(run["current_round"]), consecutive_errors=next_errors,
+                            no_progress_cycles=int(run["no_progress_cycles"]), convergence_cycles=int(run["convergence_cycles"]),
+                            recent_metrics=[], provider_type=effective_provider_type, latest_error=self._latest_model_error(run_id),
+                            resource_usage=self._resource_usage(run_id, effective_provider_type, run["started_at"] or run["created_at"], int(run["current_round"])),
+                            emergency_stop=self._emergency_stop_requested()) if run["max_rounds"] == 0 else None
+                        terminal = run["max_rounds"] != 0 or bool(decision and (decision.should_stop or decision.should_sleep))
+                        final_status = (decision.next_state if decision else "failed") if terminal else "running"
+                        final_reason = decision.reason if decision and decision.reason else run_error
+                        session_summary = self._session_summary(run, [], final_reason) if terminal and run["max_rounds"] == 0 else {}
+                        if decision:
+                            session_summary["reason_code"] = decision.reason_code
                         with connection() as conn:
-                            conn.execute("UPDATE research_runs SET status='failed',error=?,updated_at=? WHERE id=?", (run_error, utc_now(), run_id))
+                            conn.execute("UPDATE research_runs SET status=?,consecutive_errors=?,error=?,session_summary_json=?,updated_at=? WHERE id=?",
+                                (final_status, next_errors, final_reason if terminal else f"{run_error} 将自动重试（{next_errors}/{config.max_consecutive_errors}）",
+                                 json.dumps(session_summary, ensure_ascii=False), utc_now(), run_id))
                             conn.commit()
-                        return
+                        if terminal:
+                            return
+                        time.sleep(2)
+                        continue
                     debate_modes = {"theory_attack", "peer_review", "experiment_design"}
                     debate_limit = DEPTH_BUDGETS.get(run["research_depth"], DEPTH_BUDGETS["normal"])["max_debate_rounds"]
                     if run["workflow_mode"] in debate_modes and debate_limit > 0:
@@ -718,7 +1221,8 @@ class ResearchEngine:
                                 + "\n\n请进行交叉质疑：逐条指出最关键的无来源主张、逻辑缺口、反例、已有理论替代解释和可证伪条件。明确区分内部理论文档、外部文献与模型推断；不要为待研究理论辩护。")
                             reviewer = AGENTS["debate_critic"]
                             try:
-                                critique = self._call_model(reviewer.system_prompt, critique_prompt, reviewer.temperature, reviewer.max_tokens)
+                                critique = self._call_model(reviewer.system_prompt, critique_prompt, reviewer.temperature, reviewer.max_tokens,
+                                    run_id=run_id, cycle_no=round_no, agent_id="debate_critic", purpose="peer_review")
                                 self._save_output(run_id, round_no, "debate_critic", critique, source_records)
                                 completed.append(f"{reviewer.name}（交叉质疑）：\n{critique[:1400]}")
                             except Exception as exc:
@@ -740,7 +1244,8 @@ class ResearchEngine:
                                 response_profile = AGENTS["debate_response"]
                                 try:
                                     response_text = self._call_model(responder.system_prompt + response_profile.system_prompt,
-                                        response_prompt, response_profile.temperature, response_profile.max_tokens)
+                                        response_prompt, response_profile.temperature, response_profile.max_tokens,
+                                        run_id=run_id, cycle_no=round_no, agent_id="debate_response", purpose="peer_response")
                                     self._save_output(run_id, round_no, "debate_response", response_text, source_records)
                                     completed.append(f"{response_profile.name}（回应）：\n{response_text[:1200]}")
                                 except Exception as exc:
@@ -759,7 +1264,8 @@ class ResearchEngine:
                                 "- [hypothesis] 未验证假设；- [prediction] 可检验预测；"
                                 "- [counterevidence] 反例；- [limitation] 未知或限制。")
                             synthesis_agent = AGENTS["synthesis"]
-                            summary = self._call_model(synthesis_system, synthesis_prompt, synthesis_agent.temperature, min(synthesis_agent.max_tokens, 800))
+                            summary = self._call_model(synthesis_system, synthesis_prompt, synthesis_agent.temperature, min(synthesis_agent.max_tokens, 800),
+                                run_id=run_id, cycle_no=round_no, agent_id="synthesis", purpose="synthesis")
                             self._save_output(run_id, round_no, "synthesis", summary, source_records)
                         except Exception as exc:
                             summary = f"本轮综合失败：{str(exc)[:500]}"
@@ -779,18 +1285,59 @@ class ResearchEngine:
                     if refreshed["status"] == "pause_requested":
                         self._set_status(run_id, "paused")
                         return
+                    metrics = self._record_cycle_metrics(run_id, round_no, summary,
+                        ContinuousResearchConfig.from_dict(json.loads(refreshed["continuous_config_json"] or "{}")))
+                    if refreshed["max_rounds"] == 0:
+                        next_state = self._apply_continuous_policy(refreshed, metrics)
+                        if next_state in ("sleeping", "stopped", "failed"):
+                            return
+                    refreshed = self._state(run_id)
+                    if not refreshed or refreshed["status"] == "cancel_requested":
+                        self._set_status(run_id, "cancelled")
+                        return
+                    if refreshed["status"] == "pause_requested":
+                        self._set_status(run_id, "paused")
+                        return
                     if refreshed["max_rounds"] and round_no >= refreshed["max_rounds"]:
                         self._set_status(run_id, "completed")
                         return
                     # Avoid an unbounded hot loop when the search/model provider fails.
                     time.sleep(2)
         except Exception as exc:
+            ResearchEngine._checkpoint_runtime(run_id)
             with connection() as conn:
                 conn.execute("UPDATE research_runs SET status='failed',error=?,updated_at=? WHERE id=?", (str(exc)[:1000], utc_now(), run_id))
                 conn.commit()
 
     @staticmethod
+    def _checkpoint_runtime(run_id: str):
+        now = datetime.now(timezone.utc)
+        with connection() as conn:
+            run = conn.execute("SELECT started_at,runtime_seconds_total,status FROM research_runs WHERE id=?", (run_id,)).fetchone()
+            if not run or run["status"] not in ("planning", "running", "converging", "pause_requested", "cancel_requested"):
+                return
+            started_at = run["started_at"]
+            if not started_at:
+                return
+            elapsed = max(0.0, (now - datetime.fromisoformat(started_at)).total_seconds())
+            conn.execute("UPDATE research_runs SET runtime_seconds_total=runtime_seconds_total+?,started_at=? WHERE id=?",
+                         (elapsed, now.isoformat(), run_id))
+
+    @staticmethod
+    def _runtime_seconds(run_id: str) -> float:
+        with connection() as conn:
+            run = conn.execute("SELECT runtime_seconds_total,started_at,status FROM research_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return 0.0
+        total = float(run["runtime_seconds_total"] or 0)
+        if run["status"] in ("planning", "running", "converging", "pause_requested", "cancel_requested") and run["started_at"]:
+            total += max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(run["started_at"])).total_seconds())
+        return total
+
+    @staticmethod
     def _set_status(run_id: str, status: str):
+        if status not in ("running", "planning", "converging"):
+            ResearchEngine._checkpoint_runtime(run_id)
         with connection() as conn:
             conn.execute("UPDATE research_runs SET status=?,updated_at=? WHERE id=?", (status, utc_now(), run_id))
             conn.commit()
@@ -807,6 +1354,14 @@ def create_research_router(current_user: Callable[..., Dict], rag_store: Any) ->
     @router.get("/workflows")
     def research_workflows(user: Dict = Depends(current_user)):
         return [{**profile.to_public_dict(), "budgets": DEPTH_BUDGETS} for profile in WORKFLOWS.values()]
+
+    @router.get("/emergency-stop")
+    def research_emergency_stop_status(user: Dict = Depends(current_user)):
+        return engine.emergency_stop_status()
+
+    @router.post("/emergency-stop")
+    def research_emergency_stop(payload: EmergencyStopRequest, user: Dict = Depends(current_user)):
+        return engine.set_emergency_stop(payload.enabled)
 
     @router.post("/route")
     def preview_research_route(payload: PreviewRouteRequest, user: Dict = Depends(current_user)):
