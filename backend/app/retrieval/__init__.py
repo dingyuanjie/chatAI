@@ -1,2 +1,3 @@
-"""Knowledge retrieval interfaces and adapters."""
+"""知识库检索接口与适配器，使科研引擎可以复用聊天侧已有的 RAG 仓储。"""
+# 中文模块说明：知识检索抽象模块，向科研流程提供统一的知识库查询协议和现有 RAG 存储适配器。
 

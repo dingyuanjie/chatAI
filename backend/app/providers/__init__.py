@@ -1,2 +1,3 @@
-"""Model provider interfaces and implementations."""
+"""模型提供方包：定义统一协议和响应数据结构，并提供本地 Ollama/远端 OpenAI-compatible 适配器及其注册、价格估算模块。"""
+# 中文模块说明：模型提供方抽象与适配层，统一模型请求、能力描述、用量解析、费用估算和后端工厂选择，避免业务逻辑绑定单一供应商。
 

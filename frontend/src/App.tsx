@@ -1,3 +1,13 @@
+/*
+ * 页面总入口与交互编排：
+ * 1. AuthScreen 负责登录/注册及登录页的语言、主题切换；
+ * 2. ScienceWorkspace 是独立的多智能体科研工作区，管理任务、轮询、停止策略、
+ *    智能体输出、证据图谱和持续运行资源指标；
+ * 3. App 负责登录态、对话会话、SSE 流式消息、Markdown 知识库、全局模型设置，
+ *    并通过侧栏在普通对话与科学探索之间切换。
+ * 重要约束：API 请求统一使用相对 /api 路径，由 Vite 开发代理转发；登录依赖
+ * HttpOnly Cookie，所以 Axios 和 EventSource 都需要启用凭据。
+ */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, ConfigProvider, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Select, Spin, Switch, Upload, message as toast, theme as antdTheme } from "antd";
 import {
@@ -14,6 +24,7 @@ import "./style.css";
 
 axios.defaults.withCredentials = true;
 
+// 下列类型描述后端 API 返回的数据结构；将接口字段集中声明，减少组件内的隐式假设。
 type User = { id: string; email: string; name: string };
 type ChatItem = { role: "human" | "ai" | "assistant" | "system"; content: string };
 type ChatSession = { session_id: string; title: string; updated_at: string };
@@ -35,6 +46,7 @@ type ResearchGraph = { run_id: string; round_start: number; round_end: number; n
 type ResearchRun = { id: string; title: string; question: string; agents: string[]; workflow_mode: string; research_depth: string; route_reason: string; current_stage?: string; tasks?: ResearchTask[]; evidence?: ResearchEvidence[]; claims?: ResearchClaim[]; related_memory?: ResearchMemory[]; memory?: ResearchMemory[]; max_rounds: number | null; continuous: boolean; current_round: number; status: string; summary: string; error: string; updated_at: string; started_at?: string; outputs?: ResearchOutput[]; continuous_config?: Record<string, any>; cycle_metrics?: Record<string, any>[]; session_summary?: Record<string, any>; no_progress_cycles?: number; convergence_cycles?: number; consecutive_errors?: number; provider_id?: string; provider_type?: string; model_name?: string; resource_usage?: Record<string, any> };
 
 const newId = () => crypto.randomUUID();
+// 已知后端中文错误的英文映射；没有映射的服务端信息会原样显示，避免吞掉有效诊断。
 const apiErrorInEnglish: Record<string, string> = {
   "请输入有效的邮箱地址": "Enter a valid email address.",
   "密码长度需要在 8 到 256 个字符之间": "Password must be between 8 and 256 characters.",
@@ -55,6 +67,7 @@ const apiErrorText = (error: any, locale: Locale, fallback: string) => {
   return locale === "en" ? apiErrorInEnglish[detail] || detail : detail;
 };
 
+/** 登录/注册共用表单。切换模式时清理表单，身份验证成功后由父组件更新登录态。 */
 function AuthScreen({ onAuth, locale, setLocale, theme, setTheme }: {
   onAuth: (user: User) => void;
   locale: Locale;
@@ -67,6 +80,7 @@ function AuthScreen({ onAuth, locale, setLocale, theme, setTheme }: {
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm();
   const submit = async (values: { email: string; password: string; name?: string }) => {
+    // 同一表单根据当前模式调用不同端点；busy 状态避免重复提交。
     setBusy(true);
     try {
       const { data } = await axios.post<User>(`/api/auth/${registering ? "register" : "login"}`, values);
@@ -111,7 +125,13 @@ function AuthScreen({ onAuth, locale, setLocale, theme, setTheme }: {
   </main>;
 }
 
+/**
+ * 科学探索独立工作区。
+ * 它不复用聊天消息状态：通过科研 API 创建/控制任务，并定时刷新所选任务详情，
+ * 因而浏览聊天或切换侧栏不会中断后端的长时间研究进程。
+ */
 function ScienceWorkspace({ locale, t, modelSettings }: { locale: Locale; t: (zh: string, en: string) => string; modelSettings: ModelSettings | null }) {
+  // 工作区数据和弹窗状态：任务详情、图谱、智能体输出各自独立，防止选择变化互相覆盖。
   const [agents, setAgents] = useState<ResearchAgent[]>([]);
   const [workflows, setWorkflows] = useState<ResearchWorkflow[]>([]);
   const [runs, setRuns] = useState<ResearchRun[]>([]);
@@ -148,6 +168,7 @@ function ScienceWorkspace({ locale, t, modelSettings }: { locale: Locale; t: (zh
   const [filter, setFilter] = useState("all");
   const maxSelectableAgents = Math.min(researchDepth === "fast" ? 3 : researchDepth === "deep" ? 15 : 7, agents.length);
   const activeProviderType = modelSettings?.provider === "remote" ? "REMOTE" : "LOCAL";
+  // 连续运行默认预算随全局模型来源切换：远端关注调用/Token/费用，本地不展示费用上限。
   useEffect(() => {
     if (activeProviderType === "REMOTE") { setMaxRuntimeMinutes(120); setMaxContinuousCycles(50); setMaxModelCalls(100); setMaxSessionTokens(500000); setMaxSessionCost(5); }
     else { setMaxRuntimeMinutes(180); setMaxContinuousCycles(60); setMaxModelCalls(250); setMaxSessionTokens(null); setMaxSessionCost(null); }
@@ -169,6 +190,7 @@ function ScienceWorkspace({ locale, t, modelSettings }: { locale: Locale; t: (zh
     paused: t("已暂停", "Paused"), cancel_requested: t("正在停止…", "Stopping…"), cancelled: t("已停止", "Stopped"),
     completed: t("已完成", "Completed"), failed: t("遇到错误", "Needs attention"),
   }[status] || status);
+  // 任务卡片列表与右侧详情分别请求，详情轮询失败时保留上一次可读状态。
   const refreshRuns = useCallback(async () => {
     const { data } = await axios.get<ResearchRun[]>("/api/research/runs");
     setRuns(data);
@@ -216,6 +238,7 @@ function ScienceWorkspace({ locale, t, modelSettings }: { locale: Locale; t: (zh
     }
     setCreating(true);
     try {
+      // max_rounds=0 表示持续研究，实际停止由后端预算、收敛和人工控制共同决定。
       const payload = { title: title.trim() || cleanQuestion.split("\n")[0].slice(0, 80), question: cleanQuestion, agents: autoRoute ? [] : selectedAgents, workflow_mode: workflowMode, research_depth: researchDepth, max_rounds: continuous ? 0 : (maxRounds || 5), continuous_config: { preset: continuousPreset, max_runtime_minutes: maxRuntimeMinutes || (activeProviderType === "REMOTE" ? 120 : 180), max_cycles: maxContinuousCycles || (activeProviderType === "REMOTE" ? 50 : 60), no_progress_patience: noProgressPatience || 4, max_consecutive_errors: maxConsecutiveErrors || 5, max_model_calls: maxModelCalls, max_session_tokens: maxSessionTokens, max_session_cost: maxSessionCost, cost_currency: "USD", auto_sleep_enabled: autoSleepEnabled, judge_enabled: judgeEnabled, final_escape_cycle_enabled: finalEscapeEnabled } };
       const { data } = await axios.post<ResearchRun>("/api/research/runs", payload);
       setCreateOpen(false); setQuestion(""); setTitle("");
@@ -322,7 +345,9 @@ function ScienceWorkspace({ locale, t, modelSettings }: { locale: Locale; t: (zh
   </div>;
 }
 
+/** 主应用壳：集中持有跨页面的登录、会话、知识库、模型偏好和外观设置。 */
 export default function App() {
+  // 语言和主题存入浏览器本地偏好；账号和数据仍由后端 Cookie 会话决定。
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("chatai_locale") === "en" ? "en" : "zh");
   const [theme, setTheme] = useState<Theme>(() => localStorage.getItem("chatai_theme") === "dark" ? "dark" : "light");
   const [activeView, setActiveView] = useState<"chat" | "research">("chat");
@@ -354,6 +379,7 @@ export default function App() {
   const t = useCallback((zh: string, en: string) => locale === "zh" ? zh : en, [locale]);
 
   useEffect(() => {
+    // 启动时先验证 Cookie 登录态；仅认证成功后再加载私有会话和知识库列表。
     document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
     document.documentElement.dataset.theme = theme;
     document.title = locale === "zh" ? "结构生力理论 · 研究空间" : "Structural Vital Force Theory · Research Space";
@@ -462,6 +488,7 @@ export default function App() {
     setInput(""); setLoading(true); setBottomVisible(false);
     setMessages((m) => [...m, { role: "human", content: clean }, { role: "assistant", content: "" }]);
     const params = new URLSearchParams({ session_id: sessionId, message: clean });
+    // SSE 逐片追加到最后一条 assistant 消息。事件结束或断线时都关闭连接并复位 loading。
     const es = new EventSource(`/api/chat/stream?${params.toString()}`);
     es.onmessage = (ev) => setMessages((m) => { const last = m[m.length - 1]; return last?.role === "assistant" ? [...m.slice(0, -1), { ...last, content: last.content + (ev.data || "") }] : m; });
     es.addEventListener("done", () => { setLoading(false); es.close(); void refreshSessions(); });
@@ -487,6 +514,7 @@ export default function App() {
     try { const { data } = await axios.get<PreviewFile>(`/api/rag/files/${fileId}`); setPreviewFile(data); }
     catch (e: any) { toast.error(apiErrorText(e, locale, t("Markdown 预览加载失败", "Could not load the Markdown preview"))); }
   };
+  // 先读取版本目录，再比较最近两个版本；版本内容不会写回原文件。
   const showVersions = async (file: KnowledgeFile) => {
     try {
       const { data } = await axios.get<KnowledgeVersion[]>(`/api/rag/files/${file.id}/versions`);
@@ -513,6 +541,7 @@ export default function App() {
   if (!user) return <ConfigProvider theme={themeConfig}><AuthScreen onAuth={setUser} locale={locale} setLocale={setLocale} theme={theme} setTheme={setTheme} /></ConfigProvider>;
 
   return <ConfigProvider theme={themeConfig}><div className="app-shell">
+    {/* 响应式主框架：窄屏时侧栏转为抽屉式面板，遮罩负责关闭导航。 */}
     {sidebarOpen && <button className="mobile-scrim" onClick={() => setSidebarOpen(false)} aria-label={t("关闭导航", "Close navigation")} />}
     <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
       <div className="side-brand"><span className="brand-mark"><BulbOutlined /></span><span>{t("结构生力理论", "Structural Vital Force Theory")} <small>RESEARCH SPACE</small></span><button className="mobile-close" onClick={() => setSidebarOpen(false)} aria-label={t("关闭导航", "Close navigation")}>×</button></div>

@@ -1,4 +1,10 @@
-"""Deterministic limits and multi-signal convergence rules."""
+"""连续科研的分层停止策略。
+
+公共策略处理手动/紧急停止、运行时长、轮数、错误上限和多信号收敛；本地策略检查
+本地模型可用性与 Token 预算；远端策略额外检查 API 配额、限流、鉴权、调用数、
+Token 和可估算费用。策略返回结构化 StopDecision，由控制器决定状态转换与摘要。
+"""
+# 中文模块说明：连续科研策略组件，提供进展度量、循环/新颖度检测、资源预算和自动停止决策；策略代码保持可独立测试，不直接调用模型服务。
 
 from statistics import mean
 from typing import Any, Dict, List, Optional
@@ -7,20 +13,24 @@ from .models import ContinuousResearchConfig, StopDecision, StopReason
 
 
 class CommonResearchPolicy:
+    """评估不依赖模型供应商的停止条件与研究收敛信号。"""
     @staticmethod
     def evaluate(config: ContinuousResearchConfig, *, state: str, elapsed_minutes: float,
                  cycles: int, consecutive_errors: int, no_progress_cycles: int,
                  convergence_cycles: int, recent_metrics: List[Dict[str, Any]],
                  manual_stop: bool = False, emergency_stop: bool = False,
                  judge: Optional[Dict[str, Any]] = None) -> StopDecision:
+        """先执行人工/紧急停止、运行时长、周期和错误硬限制，再评估软性收敛信号。
+
+        judge 只能影响软性收敛后的重规划选择，不能覆盖任何人工决定或硬上限。
+        """
         latest = recent_metrics[-1] if recent_metrics else {}
         base_metrics = {"elapsed_minutes": round(elapsed_minutes, 1), "cycles": cycles,
                         "consecutive_errors": consecutive_errors, "no_progress_cycles": no_progress_cycles,
                         "convergence_cycles": convergence_cycles, "information_gain_score": latest.get("information_gain_score", 0),
                         "novelty_score": latest.get("novelty_score", 0), "loop_score": latest.get("loop_score", 0),
                         "executable_tasks": latest.get("executable_tasks", 0)}
-        # Manual stop must win over every automatic rule; the persistent flag is
-        # checked before this method as well as here for direct unit coverage.
+        # 人工停止优先级最高；全局紧急停止次之，然后才检查自动硬性上限。
         if manual_stop:
             return StopDecision(True, False, "stopped", "用户手动停止", "MANUAL_STOP", base_metrics)
         if emergency_stop:
@@ -34,8 +44,7 @@ class CommonResearchPolicy:
         if not config.auto_sleep_enabled:
             return StopDecision(next_state="running", metrics=base_metrics)
 
-        # A converging run that produces meaningful new information has
-        # recovered; reset its soft-stop state and let it continue.
+        # 收敛观察期间若重新产生有效信息增量，说明研究恢复进展，撤销软性停止趋势。
         if state == "converging" and float(latest.get("information_gain_score", 0)) >= config.min_information_gain:
             return StopDecision(next_state="running", reason="本轮出现新的有效进展，退出收敛确认", reason_code="NEW_PROGRESS", metrics=base_metrics)
 
@@ -66,8 +75,10 @@ class CommonResearchPolicy:
 
 
 class LocalResourcePolicy:
+    """本地模型资源规则；本地调用不估算费用。"""
     @staticmethod
     def evaluate(config: ContinuousResearchConfig, usage: Dict[str, Any], error: Optional[Dict[str, Any]]) -> Optional[StopDecision]:
+        """检查本地模型可用性错误，以及供应商实际报告的累计 Token 是否达到预算。"""
         error_code = str((error or {}).get("error_code") or "")
         if error_code in ("LOCAL_RESOURCE_ERROR", "MODEL_UNAVAILABLE"):
             reason = StopReason.LOCAL_RESOURCE_ERROR if error_code == "LOCAL_RESOURCE_ERROR" else StopReason.MODEL_UNAVAILABLE
@@ -81,8 +92,13 @@ class LocalResourcePolicy:
 
 
 class RemoteResourcePolicy:
+    """远端 API 规则；负责错误归类和调用、Token、可估算费用预算。"""
     @staticmethod
     def evaluate(config: ContinuousResearchConfig, usage: Dict[str, Any], error: Optional[Dict[str, Any]]) -> Optional[StopDecision]:
+        """将配额/限流/鉴权/网络错误转为停止原因，再检查各项可用预算。
+
+        只有已知并且币种匹配的费用才参与费用上限判断；用量或价格未知时不假定为零。
+        """
         error_code = str((error or {}).get("error_code") or "")
         mapped = {"API_QUOTA_EXHAUSTED": StopReason.API_QUOTA_EXHAUSTED,
                   "REMOTE_RATE_LIMIT": StopReason.API_RATE_LIMITED,
@@ -111,6 +127,7 @@ class RemoteResourcePolicy:
 
 
 class StopPolicyEngine:
+    """公共停止规则与模型来源专属资源规则的统一决策入口。"""
     @staticmethod
     def evaluate(config: ContinuousResearchConfig, *, state: str, elapsed_minutes: float,
                  cycles: int, consecutive_errors: int, no_progress_cycles: int,
@@ -119,6 +136,7 @@ class StopPolicyEngine:
                  judge: Optional[Dict[str, Any]] = None, provider_type: str = "LOCAL",
                  resource_usage: Optional[Dict[str, Any]] = None,
                  latest_error: Optional[Dict[str, Any]] = None) -> StopDecision:
+        """公共策略若产生硬性终止就立即返回，否则按 LOCAL/REMOTE/HYBRID 选择资源策略。"""
         common = CommonResearchPolicy.evaluate(config, state=state, elapsed_minutes=elapsed_minutes,
             cycles=cycles, consecutive_errors=consecutive_errors, no_progress_cycles=no_progress_cycles,
             convergence_cycles=convergence_cycles, recent_metrics=recent_metrics,

@@ -1,3 +1,4 @@
+# 中文模块说明：验证 OpenAI-compatible 模型适配器、生成 Token 限制、错误处理、用量解析和费用估算。
 import os
 import unittest
 from unittest.mock import Mock, patch
@@ -8,13 +9,16 @@ from app.providers.openai_compatible import OpenAICompatibleChatModel
 
 
 class ResearchModelAdapterTests(unittest.TestCase):
+    """验证聊天模型适配器的远端兼容性、Token 边界与用量记录。"""
     def test_deepseek_reasoning_models_get_a_reasonable_completion_budget(self):
+        """确认 DeepSeek 推理模型有足够输出空间容纳推理 Token 和可见答案。"""
         self.assertEqual(completion_token_limit("remote", "deepseek-reasoner", 1200), 16384)
         self.assertEqual(completion_token_limit("remote", "deepseek-chat", 800), 8192)
         self.assertEqual(completion_token_limit("local", "deepseek-reasoner", 1200), 1200)
 
     @patch("app.providers.openai_compatible.httpx.post")
     def test_uses_configured_model_and_profile_generation_limits(self, post):
+        """确认适配器使用设置中的模型，并保留专家档案规定的输出长度约束。"""
         response = Mock()
         response.status_code = 200
         response.json.return_value = {
@@ -36,6 +40,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
 
     @patch("app.providers.openai_compatible.httpx.post")
     def test_explains_empty_output_after_generation_limit(self, post):
+        """确认模型只返回 length 结束原因时给出“生成上限”诊断，而非误报输入超长。"""
         response = Mock()
         response.status_code = 200
         response.json.return_value = {
@@ -51,6 +56,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
 
     @patch("app.providers.openai_compatible.httpx.post")
     def test_supports_configured_openai_compatible_endpoint(self, post):
+        """确认远端自定义 API 地址、模型 ID 和认证信息会被正确用于请求。"""
         response = Mock()
         response.status_code = 200
         response.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
@@ -66,6 +72,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
 
     @patch("app.providers.openai_compatible.httpx.post")
     def test_explains_context_window_rejection(self, post):
+        """确认服务端拒绝上下文长度时错误信息能区分输入窗口与生成 Token 上限。"""
         response = Mock()
         response.status_code = 400
         response.text = '{"error":{"message":"prompt exceeds the available context length"}}'
@@ -80,6 +87,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
 
     @patch("app.providers.openai_compatible.httpx.post")
     def test_remote_usage_is_normalized_and_priced_only_when_configured(self, post):
+        """确认远端 Token 用量字段可归一化，且只有配置价格时才估算费用。"""
         response = Mock()
         response.status_code = 200
         response.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
@@ -96,6 +104,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
 
     @patch("app.providers.openai_compatible.httpx.post")
     def test_unknown_remote_model_has_no_fabricated_cost(self, post):
+        """确认未配置价格的模型费用保持未知，不会被误记为零。"""
         response = Mock()
         response.status_code = 200
         response.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
@@ -105,6 +114,7 @@ class ResearchModelAdapterTests(unittest.TestCase):
         self.assertIsNone(provider.generate("s", "p").usage.estimated_cost)
 
     def test_synthesis_prompt_is_bounded_for_small_local_context(self):
+        """确认综合提示在小上下文模型下会限制问题和专家正文长度。"""
         outputs = [f"专家{i}：\n" + ("[finding] 支持该推论但仍需检验 [W1]。" * 100) for i in range(6)]
         prompt = ResearchEngine._synthesis_prompt("统一底层原理", "结构和涌现" * 100, 12, outputs)
 

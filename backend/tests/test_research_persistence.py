@@ -1,3 +1,4 @@
+# 中文模块说明：验证科研任务/输出/图谱的持久化、所有者隔离、模型切换记录、记忆恢复及调用预算。
 import tempfile
 import unittest
 import sqlite3
@@ -10,17 +11,21 @@ from app.providers.models import ModelProviderError, ModelUsage
 
 
 class ResearchPersistenceTests(unittest.TestCase):
+    """覆盖科研任务的数据库生命周期、用户隔离、证据图谱、记忆、恢复和资源记录。"""
     def setUp(self):
+        """为每个测试创建临时研究数据库和独立科研引擎。"""
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = research.RESEARCH_DB
         research.RESEARCH_DB = Path(self.temp_dir.name) / "research.sqlite"
         self.engine = ResearchEngine(rag_store=object())
 
     def tearDown(self):
+        """恢复原数据库路径并删除测试产生的临时文件。"""
         research.RESEARCH_DB = self.db_path
         self.temp_dir.cleanup()
 
     def test_run_and_output_are_persisted_and_owner_scoped(self):
+        """确认任务和输出会持久化，并且只有创建者能够读取任务详情。"""
         payload = CreateResearchRun(
             title="结构问题",
             question="结构生力有哪些可检验定义？",
@@ -43,6 +48,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 404)
 
     def test_model_switch_usage_is_logged_without_resetting_research_memory(self):
+        """确认同一研究切换本地/远端模型时分别记录用量，同时保留已有研究记忆。"""
         payload = CreateResearchRun(title="Provider 切换", question="检查切换模型后记忆是否保留。", agents=["math", "critic"], max_rounds=0)
         with patch.object(self.engine, "_start"):
             run = self.engine.create(payload, "owner-a")
@@ -59,6 +65,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual({item["provider_type"] for item in detail["resource_usage"]["model_breakdown"]}, {"LOCAL", "REMOTE"})
 
     def test_model_call_budget_is_reserved_before_parallel_requests(self):
+        """确认并行调用必须先原子预留额度，预算最后一个名额不能被两个请求同时使用。"""
         payload = CreateResearchRun(title="调用预算", question="检查并发请求不会突破调用预算。", agents=["math", "critic"],
             max_rounds=0, continuous_config={"preset": "balanced", "max_model_calls": 1})
         with patch.object(self.engine, "_start"):
@@ -76,6 +83,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual(detail["resource_usage"]["model_breakdown"][0]["pending_calls"], 1)
 
     def test_runtime_usage_survives_pause_and_resume(self):
+        """确认累计运行秒数在暂停和恢复后保留，并继续出现在资源统计中。"""
         with patch.object(self.engine, "_start"):
             run = self.engine.create(CreateResearchRun(title="累计运行时长", question="检查续跑资源统计。", agents=["math", "critic"],
                 max_rounds=0), "owner-a")
@@ -88,6 +96,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertGreaterEqual(detail["resource_usage"]["runtime_seconds"], 125)
 
     def test_output_evidence_is_normalized_and_linked_to_agent_task(self):
+        """确认输出引用会转换为证据记录，结构化主张可与证据建立支持/反驳关系。"""
         payload = CreateResearchRun(
             title="来源追踪",
             question="检查资料来源如何链接到研究结论？",
@@ -122,6 +131,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual(graph_error.exception.status_code, 404)
 
     def test_cross_run_memory_is_retrieved_by_relevance_and_owner_scoped(self):
+        """确认历史研究记忆按问题相关性复用，并严格限制在相同用户范围。"""
         with patch.object(self.engine, "_start"):
             prior = self.engine.create(CreateResearchRun(
                 title="结构生力的可证伪预测",
@@ -156,6 +166,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual(len(detail["memory"]), 0)
 
     def test_internal_debate_output_is_saved_as_a_debate_stage(self):
+        """确认交叉质疑输出保存为独立评审阶段并能显示正确专家名称。"""
         payload = CreateResearchRun(
             title="理论评审",
             question="请攻击结构生力理论的核心主张。",
@@ -173,6 +184,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual(detail["outputs"][0]["agent_name"], "交叉质疑评审员")
 
     def test_theory_attack_runs_critic_before_synthesis_and_completes(self):
+        """确认理论攻击工作流先执行批判评审与研究员回应，再生成综合结果。"""
         payload = CreateResearchRun(
             title="理论攻击测试",
             question="请攻击结构生力理论的核心主张。",
@@ -185,6 +197,7 @@ class ResearchPersistenceTests(unittest.TestCase):
 
         prompts = []
         def answer(system, prompt, temperature=0.35, max_tokens=2048, **kwargs):
+            """验证科研输出、任务阶段和运行状态写入 SQLite 后，可以通过详情接口完整读回。"""
             prompts.append(prompt)
             return f"完成：{system[:20]}"
 
@@ -203,6 +216,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual(len(detail["memory"]), 1)
 
     def test_legacy_database_gets_stage_and_evidence_tables(self):
+        """确认旧版数据库在初始化时可迁移到任务阶段、证据和主张关联表。"""
         active_db = research.RESEARCH_DB
         legacy_dir = tempfile.TemporaryDirectory()
         legacy_db = Path(legacy_dir.name) / "legacy.sqlite"
@@ -244,6 +258,7 @@ class ResearchPersistenceTests(unittest.TestCase):
             legacy_dir.cleanup()
 
     def test_failed_run_resumes_from_saved_checkpoint(self):
+        """确认失败任务恢复时从已保存检查点继续，而不是重新创建任务。"""
         payload = CreateResearchRun(
             title="持续研究",
             question="宇宙学结构与观测如何比较？",
@@ -263,6 +278,7 @@ class ResearchPersistenceTests(unittest.TestCase):
         self.assertEqual(resumed["current_round"], 3)
 
     def test_non_registered_and_internal_agents_cannot_be_selected(self):
+        """确认未知 ID 与仅内部角色不能通过用户请求进入专家列表。"""
         for selected in (["physics", "not-registered"], ["physics", "synthesis"]):
             payload = CreateResearchRun(
                 title="验证",

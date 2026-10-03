@@ -1,4 +1,5 @@
-"""Transparent, bounded first-pass routing for research questions."""
+"""可解释且有数量上限的科研角色路由：优先遵循用户显式选择，再结合研究工作流、问题关键词和研究深度自动选取专家。"""
+# 中文模块说明：科研智能体配置与路由模块，负责专家角色定义、配置加载校验、领域匹配和研究工作流约束。
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
@@ -9,6 +10,7 @@ from .workflows import DEPTH_BUDGETS, WORKFLOWS
 
 @dataclass(frozen=True)
 class RoutePlan:
+    """路由规划结果：包含专家 ID、工作流、档位、选角原因和并行预算。"""
     agent_ids: List[str]
     workflow_mode: str
     research_depth: str
@@ -17,7 +19,7 @@ class RoutePlan:
 
 
 class AgentRouter:
-    """Routes by explicit workflow plus auditable keyword/domain rules."""
+    """按照明确的研究工作流和可审计的领域关键词规则规划专家列表，不在路由阶段调用大模型。"""
 
     DOMAIN_RULES = (
         (("广义相对论", "时空曲率", "引力波", "general relativity", "spacetime curvature", "gravitational wave"), ("relativity", "physics", "cosmology"), "相对论/引力"),
@@ -63,6 +65,7 @@ class AgentRouter:
     )
 
     def __init__(self, registry: AgentRegistry):
+        """保存配置目录；所有最终角色必须来自该注册表中的可选专家。"""
         self.registry = registry
 
     def route(
@@ -72,6 +75,11 @@ class AgentRouter:
         research_depth: str = "normal",
         requested_agents: Optional[Sequence[str]] = None,
     ) -> RoutePlan:
+        """根据显式角色或问题命中领域规则形成有上限的专家列表。
+
+        用户手动选择时不偷偷增删角色；自动路由时先取最多两个领域命中，再结合工作流
+        必需角色补齐。最终至少两个角色，并强制遵守对应研究深度的 active-agent 上限。
+        """
         if workflow_mode not in WORKFLOWS:
             raise ValueError(f"Unsupported workflow mode: {workflow_mode}")
         if research_depth not in DEPTH_BUDGETS:
@@ -98,8 +106,7 @@ class AgentRouter:
                 if any(keyword.casefold() in text for keyword in keywords):
                     matched_domains.append(label)
                     candidates.extend(agent_ids)
-                    # one domain match is usually sufficient; unrelated matches
-                    # can still be added when the prompt clearly spans domains.
+                    # 通常一个领域命中已足够；如果问题明显跨学科，最多再合并第二个领域规则。
                     if len(matched_domains) >= 2:
                         break
             domain_agents = list(dict.fromkeys(candidates))

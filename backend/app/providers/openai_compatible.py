@@ -1,4 +1,5 @@
-"""Chat-completions adapter for Ollama and other OpenAI-compatible servers."""
+"""OpenAI-compatible Chat Completions 适配器，支持本地 Ollama 与远端兼容 API。负责认证头、超时、错误分类、用量解析和价格估算。"""
+# 中文模块说明：模型提供方抽象与适配层，统一模型请求、能力描述、用量解析、费用估算和后端工厂选择，避免业务逻辑绑定单一供应商。
 
 import os
 from typing import Iterator, Optional
@@ -12,20 +13,21 @@ from .pricing import ProviderPricingConfig
 
 
 def completion_token_limit(provider: str, model: str, requested: int) -> int:
-    """Keep profile-sized local outputs, but allow enough room for hosted reasoning models."""
+    """本地生成长度遵循专家档案限制；DeepSeek 远端推理模型会额外预留推理 Token 空间，避免生成预算耗尽后只返回空正文。"""
     if provider != "remote" or "deepseek" not in model.casefold():
         return requested
     model_id = model.casefold()
-    # DeepSeek reasoning tokens and the visible answer share max_tokens. The
-    # research profiles' 800–1,600 token caps can be consumed before an answer
-    # is produced, even when the prompt easily fits the context window.
+    # DeepSeek 将推理 Token 与可见答案共用 max_tokens；专家档案原本较小的输出预算
+    # 可能在正文开始前就被推理过程用完，这和输入上下文是否超长是两个独立问题。
     minimum = 16_384 if any(marker in model_id for marker in ("reasoner", "r1", "thinking", "v4", "flash")) else 8_192
     return max(requested, minimum)
 
 
 class OpenAICompatibleChatModel:
+    """调用本地 Ollama 或远端 OpenAI-compatible Chat Completions 服务。"""
     def __init__(self, base_url: str, model: str, api_key: str = "ollama", timeout: float = 600,
                  provider_type: str = "REMOTE", provider_id: str = "openai_compatible"):
+        """保存 OpenAI 兼容服务的地址、密钥和模型参数，并初始化异步 HTTP 客户端。"""
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -38,10 +40,12 @@ class OpenAICompatibleChatModel:
 
     @classmethod
     def from_environment(cls) -> "OpenAICompatibleChatModel":
+        """把环境变量来源的数据转换为当前对象，并在边界处整理字段格式。"""
         return cls.from_settings(model_settings.get())
 
     @classmethod
     def from_settings(cls, settings: dict) -> "OpenAICompatibleChatModel":
+        """把设置来源的数据转换为当前对象，并在边界处整理字段格式。"""
         if settings["provider"] == "remote":
             base_url = settings["remote_base_url"]
             model = settings["remote_research_model"] or settings["remote_chat_model"]
@@ -68,6 +72,7 @@ class OpenAICompatibleChatModel:
         )
 
     def generate(self, system: str, prompt: str, *, temperature: float = 0.35, max_tokens: int = 2048) -> ModelResponse:
+        """发送一次非流式聊天请求，映射连接/HTTP 错误，解析正文、结束原因和 Token 用量。"""
         output_limit = completion_token_limit("remote" if self.provider_type == "REMOTE" else "local", self.model, max_tokens)
         try:
             response = httpx.post(
@@ -117,17 +122,21 @@ class OpenAICompatibleChatModel:
                              provider_type=self.provider_type, usage=usage, capabilities=self.capabilities)
 
     def stream(self, system: str, prompt: str, *, temperature: float = 0.35, max_tokens: int = 2048) -> Iterator[str]:
+        """对远端模型使用本地价格表估算费用；本地模型不生成费用值。"""
         raise NotImplementedError("Streaming is not enabled for this adapter")
 
     def get_usage(self) -> Optional[ModelUsage]:
+        """以轻量模型列表请求确认当前服务地址和认证信息可用。"""
         return self._last_usage
 
     def estimate_cost(self, usage: Optional[ModelUsage]) -> Optional[ModelUsage]:
+        """按照模型定价表和本次输入/输出 Token 数估算费用；缺少定价时不伪造金额。"""
         if self.provider_type != "REMOTE":
             return usage
         return ProviderPricingConfig.estimate(self.model, usage)
 
     def health_check(self) -> bool:
+        """检查服务配置与连接参数是否完整，为上层调用返回可读的配置诊断结果。"""
         try:
             response = httpx.get(f"{self.base_url}/models", headers={"Authorization": f"Bearer {self.api_key}"},
                                  timeout=min(self.timeout, 8), trust_env=False)

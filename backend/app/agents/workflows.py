@@ -1,4 +1,5 @@
-"""Named research modes and their bounded role/stage guidance."""
+"""科研工作流目录。每种模式声明研究指令和必需角色；DEPTH_BUDGETS 将快速、标准、深度档位映射到专家数、并发数、辩论轮数和上下文预算。"""
+# 中文模块说明：科研智能体配置与路由模块，负责专家角色定义、配置加载校验、领域匹配和研究工作流约束。
 
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -6,6 +7,7 @@ from typing import Dict, Tuple
 
 @dataclass(frozen=True)
 class WorkflowProfile:
+    """描述一种科研工作流的名称、适用场景和默认研究深度，供路由预览及任务创建共用。"""
     id: str
     name: str
     name_en: str
@@ -14,6 +16,7 @@ class WorkflowProfile:
     required_agents: Tuple[str, ...]
 
     def to_public_dict(self) -> Dict[str, object]:
+        """把当前对象转换为公开dict格式，供调用方稳定地读取或传输。"""
         return {"id": self.id, "name": self.name, "name_en": self.name_en}
 
 

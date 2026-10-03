@@ -1,4 +1,5 @@
-"""Small, dependency-light models for continuous research control."""
+"""持续科研配置与决策的数据模型。模块尽量不依赖外部框架，确保预算默认值和停止原因可以被 API、界面与单元测试共同使用。"""
+# 中文模块说明：连续科研策略组件，提供进展度量、循环/新颖度检测、资源预算和自动停止决策；策略代码保持可独立测试，不直接调用模型服务。
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -18,6 +19,7 @@ DEFAULT_WEIGHTS = {
 
 
 class StopReason(str, Enum):
+    """供 API、界面和策略判断共同使用的稳定停止原因代码。"""
     MANUAL_STOP = "MANUAL_STOP"
     MAX_RUNTIME = "MAX_RUNTIME"
     MAX_CYCLES = "MAX_CYCLES"
@@ -42,6 +44,12 @@ class StopReason(str, Enum):
 
 @dataclass
 class ContinuousResearchConfig:
+    """一次持续科研运行的规则和资源预算。
+
+    runtime/cycle/error 控制最大运行范围；进展、重复和循环字段决定何时收敛；
+    judge/escape 控制可选模型评审；provider 与 call/token/cost 字段按本地或远端
+    后端采用不同默认值。from_dict 会合并预设并统一裁剪输入范围。
+    """
     max_runtime_minutes: int = 120
     max_cycles: int = 50
     max_consecutive_errors: int = 5
@@ -65,6 +73,7 @@ class ContinuousResearchConfig:
 
     @classmethod
     def from_dict(cls, values: Dict[str, Any] | None, provider_type: str | None = None) -> "ContinuousResearchConfig":
+        """按提供方应用 conservative/balanced/explorer 预设，覆盖用户字段并裁剪预算范围。"""
         data = dict(values or {})
         preset = data.get("preset", "balanced")
         kind = str(provider_type or data.get("provider_type", "LOCAL")).upper()
@@ -103,11 +112,13 @@ class ContinuousResearchConfig:
         return config
 
     def to_dict(self) -> Dict[str, Any]:
+        """把当前对象转换为dict格式，供调用方稳定地读取或传输。"""
         return asdict(self)
 
 
 @dataclass
 class StopDecision:
+    """单次策略评估结果：是否停止/休眠、下一状态、原因代码和诊断指标。"""
     should_stop: bool = False
     should_sleep: bool = False
     next_state: str = "running"
@@ -116,4 +127,5 @@ class StopDecision:
     metrics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """把当前对象转换为dict格式，供调用方稳定地读取或传输。"""
         return asdict(self)

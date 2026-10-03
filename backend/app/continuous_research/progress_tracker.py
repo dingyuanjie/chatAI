@@ -1,4 +1,10 @@
-"""Extract heuristic, inspectable progress metrics from the saved research graph."""
+"""从已持久化的科研图谱提取可检查的进展指标。
+
+此模块使用结构化主张、证据和轮次历史计算新增量、重复率、新颖度与信息增量分数。
+判断逻辑是显式启发式而非黑盒结论，便于用户查看、单元测试和调整权重；向量服务
+只作为可选相似度来源，发生失败时退回词面相似度，不中断科研任务。
+"""
+# 中文模块说明：连续科研策略组件，提供进展度量、循环/新颖度检测、资源预算和自动停止决策；策略代码保持可独立测试，不直接调用模型服务。
 
 import re
 from typing import Any, Dict, List
@@ -14,19 +20,27 @@ METRIC_KEYS = (
 
 
 class ProgressTracker:
+    """衡量当前科研轮次相对历史记录的有效新进展。"""
     def __init__(self, weights: Dict[str, float] | None = None, duplicate_threshold: float = 0.92,
                  embed=None):
+        """保存各类信息增量的评分权重，并创建复用的主张新颖度检测器。"""
         self.weights = weights or {}
         self.novelty = NoveltyDetector(duplicate_threshold, embed)
 
     @staticmethod
     def _contains(text: str, terms: tuple[str, ...]) -> bool:
+        """检查文本是否包含给定任一关键词，用于从自然语言主张中估算实验、模型和矛盾等指标。"""
         return any(term in text for term in terms)
 
     def measure(self, claims: List[Dict[str, Any]], evidence: List[Dict[str, Any]],
                 prior_claims: List[Dict[str, Any]], prior_urls: set[str],
                 document_connections: int = 0, resolved_questions: int = 0,
                 resolved_contradictions: int = 0) -> Dict[str, Any]:
+        """对比历史主张/来源，统计新证据、反例、预测、实验和模型，并计算标准指标。
+
+        返回值包含原始计数以及停止策略读取的进展、新颖度、重复率等字段；可选向量化
+        失败时自动使用词面比较，以确保资源指标计算不会阻断任务。
+        """
         existing = [str(item.get("claim_text", item.get("text", ""))) for item in prior_claims]
         novelty_scores = []
         novel_claims = []
@@ -40,6 +54,7 @@ class ProgressTracker:
                 vectors = None
         for index, claim in enumerate(claims):
             text = claim_texts[index]
+            # 只和历史主张及本轮已接纳的新主张比较，避免重复结论被重复计为新发现。
             prior_texts = existing + [str(item.get("claim_text", "")) for item in novel_claims]
             if vectors is not None:
                 current_index = len(existing) + index
@@ -95,10 +110,12 @@ class ProgressTracker:
 
     @staticmethod
     def advance_no_progress(previous_count: int, information_gain_score: float, minimum: float) -> int:
+        """达到最低信息增量时将停滞计数清零，否则将连续无进展轮数加一。"""
         return 0 if information_gain_score >= minimum else previous_count + 1
 
     @staticmethod
     def blocked_reason(question: str) -> str:
+        """根据开放问题中的可识别关键词标注实验、数据、人工或算力阻塞原因。"""
         text = question.casefold()
         patterns = (
             ("NEEDS_EXPERIMENT", ("实验", "测量数据", "观测数据")),
@@ -116,6 +133,7 @@ class ProgressTracker:
 
     @staticmethod
     def signature(claims: List[Dict[str, Any]], summary: str) -> str:
+        """优先拼接最多 12 条主张作为本轮指纹；没有结构化主张时，压缩摘要空白并截取前 1200 字。"""
         parts = [str(item.get("claim_text", "")) for item in claims]
         if parts:
             return " ".join(parts[:12])

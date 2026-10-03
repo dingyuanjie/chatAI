@@ -1,4 +1,5 @@
-"""Durable multi-agent science exploration tasks."""
+"""多智能体科研任务主模块。任务、专家输出、证据、结构化主张、研究记忆、模型调用和连续运行状态均写入 SQLite，支持轮询、休眠和断点恢复。"""
+# 中文模块说明：科研主编排模块，负责研究任务生命周期、检索与多智能体调度、证据/主张/记忆持久化、连续运行策略、模型调用记录及 HTTP API。
 
 import json
 import os
@@ -35,6 +36,7 @@ from app.continuous_research.progress_tracker import ProgressTracker
 from app.continuous_research.resource_usage import ResearchResourceUsage
 
 
+# 科研数据库独立于账号和知识库文件；切换全局模型后，研究产物仍留在同一任务记录中。
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 RESEARCH_DB = DATA_DIR / "research.sqlite"
@@ -44,11 +46,13 @@ AGENT_ROUTER = AgentRouter(AGENT_REGISTRY)
 
 
 def utc_now() -> str:
+    """生成带时区的 UTC ISO-8601 时间戳，统一用于数据库创建、更新时间和周期记录，避免本地时区混用。"""
     return datetime.now(timezone.utc).isoformat()
 
 
 @contextmanager
 def connection():
+    """打开科研 SQLite 连接并设置忙等待和 Row 字段访问；正常退出提交、异常回滚，确保连接释放。"""
     conn = sqlite3.connect(RESEARCH_DB.as_posix(), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
@@ -63,7 +67,7 @@ def connection():
 
 
 def online_science_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
-    """Search Crossref and arXiv APIs for real scholarly material."""
+    """并行查询 Crossref 与 arXiv 学术索引，提取标题、URL 和摘要片段，按 URL 去重并限制总条数；任一外部数据源失败不会阻断科研任务。"""
     hits: List[Dict[str, str]] = []
     timeout = httpx.Timeout(20.0, connect=8.0)
     headers = {"User-Agent": "StructuralVitalForceResearch/1.0 (local research workspace)"}
@@ -113,6 +117,7 @@ def online_science_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
 
 
 class CreateResearchRun(BaseModel):
+    """新建科研任务的请求模型。约束标题、问题长度、智能体数量和轮次上限，并承载工作流、研究深度及连续运行预算设置。"""
     title: str = Field(min_length=1, max_length=160)
     question: str = Field(min_length=8, max_length=10000)
     agents: List[str] = Field(default_factory=list, max_length=15)
@@ -123,10 +128,12 @@ class CreateResearchRun(BaseModel):
 
 
 class EmergencyStopRequest(BaseModel):
+    """全局紧急停止开关请求模型；enabled 为 true 时，所有连续科研任务在下一决策点停止。"""
     enabled: bool
 
 
 class PreviewRouteRequest(BaseModel):
+    """科研路由预览请求模型，使用与创建任务相同的工作流、深度和智能体选择字段，但不创建持久化任务。"""
     question: str = Field(min_length=8, max_length=10000)
     workflow_mode: str = Field(default="multidisciplinary", min_length=1, max_length=64)
     research_depth: str = Field(default="normal", min_length=1, max_length=16)
@@ -134,10 +141,13 @@ class PreviewRouteRequest(BaseModel):
 
 
 class ResearchEngine:
+    """多智能体科研任务编排器。负责 SQLite 持久化、联网和本地资料检索、并行专家执行、交叉评审、结论综合、证据/主张/记忆关联，以及连续运行的暂停恢复和资源停止决策。"""
     def __init__(self, rag_store: Any):
+        """建立知识检索适配器、线程状态锁和持久化表结构。数据库迁移以可重复方式运行；服务重启时把仍在执行的状态恢复为 paused，等待用户续跑。"""
         self.retriever = RAGStoreAdapter(rag_store)
         self._threads: Dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        # WAL 允许前端轮询研究进度时读取数据库，而后台线程仍能持续提交新输出。
         with connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
         with connection() as conn:
@@ -247,12 +257,13 @@ class ResearchEngine:
             evidence_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_evidence)").fetchall()}
             if "citation_label" not in evidence_columns:
                 conn.execute("ALTER TABLE research_evidence ADD COLUMN citation_label TEXT NOT NULL DEFAULT ''")
-            # A process restart is a checkpoint, not a failed or lost run.
+            # 进程退出意味着存在可恢复的检查点，不应把已保存任务误判为失败或丢弃输出。
             conn.execute("UPDATE research_runs SET status='paused', updated_at=? WHERE status IN ('planning','running','converging','pause_requested','cancel_requested')", (utc_now(),))
             conn.commit()
 
     @staticmethod
     def _run_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        """将 SQLite 行记录中的 JSON 字段还原为对象，并兼容把 max_rounds=0 表示为持续运行的旧存储约定。"""
         value = dict(row)
         value["agents"] = json.loads(value.pop("agents_json"))
         value["continuous_config"] = json.loads(value.get("continuous_config_json") or "{}")
@@ -262,15 +273,18 @@ class ResearchEngine:
         return value
 
     def _get_row(self, run_id: str, owner_id: str) -> Optional[sqlite3.Row]:
+        """只按任务 ID 和所有者 ID 查询科研任务，确保后续读取和控制始终经过归属校验。"""
         with connection() as conn:
             return conn.execute("SELECT * FROM research_runs WHERE id=? AND owner_id=?", (run_id, owner_id)).fetchone()
 
     def list_runs(self, owner_id: str) -> List[Dict[str, Any]]:
+        """按 owner_id 列出用户的科研任务，转换状态、摘要和配置字段供任务侧栏展示。"""
         with connection() as conn:
             rows = conn.execute("SELECT * FROM research_runs WHERE owner_id=? ORDER BY updated_at DESC", (owner_id,)).fetchall()
         return [self._run_dict(row) for row in rows]
 
     def get_detail(self, run_id: str, owner_id: str) -> Dict[str, Any]:
+        """先校验任务归属，再汇总输出、任务阶段、来源证据、主张关系、研究记忆、周期指标和模型资源统计，形成科研详情页需要的完整快照。"""
         row = self._get_row(run_id, owner_id)
         if not row:
             raise HTTPException(404, "探索任务不存在")
@@ -312,6 +326,7 @@ class ResearchEngine:
         return data
 
     def get_graph(self, run_id: str, owner_id: str, limit_rounds: int = 50) -> Dict[str, Any]:
+        """把指定任务最近若干轮的任务、输出、结论、证据和记忆转换为节点/边结构；裁剪轮数以控制图谱查询和前端渲染规模。"""
         run = self._get_row(run_id, owner_id)
         if not run:
             raise HTTPException(404, "探索任务不存在")
@@ -374,12 +389,14 @@ class ResearchEngine:
 
     @staticmethod
     def _memory_terms(text: str) -> set[str]:
+        """从研究记忆文本中提取去重词项，供后续检索相关历史结论与开放问题。"""
         terms = set(re.findall(r"[a-z0-9]{2,}", text.casefold()))
         for phrase in re.findall(r"[\u4e00-\u9fff]+", text):
             terms.update(phrase[index:index + 2] for index in range(max(0, len(phrase) - 1)))
         return terms
 
     def _retrieve_memories(self, owner_id: str, run_id: str, round_no: int, question: str, limit: int = 3) -> List[Dict[str, Any]]:
+        """在当前用户自己的历史科研记忆中按问题词项相关性排序，排除当前任务并保存命中的关联记录；历史模型结论会作为待复核上下文，不会被提升为证据。"""
         query_terms = self._memory_terms(question)
         if not query_terms:
             return []
@@ -405,6 +422,7 @@ class ResearchEngine:
         return selected
 
     def _save_memory(self, run_id: str, round_no: int, summary: str):
+        """把每轮综合摘要、可追踪主张和开放问题写入跨轮记忆表，使断点续跑及后续相关研究可复用问题脉络。"""
         run = self._state(run_id)
         if not run:
             return
@@ -429,6 +447,7 @@ class ResearchEngine:
 
     def _record_cycle_metrics(self, run_id: str, cycle_no: int, summary: str,
                               config: ContinuousResearchConfig) -> Dict[str, Any]:
+        """从已保存的主张、来源、任务和记忆计算新颖度、信息增量、阻塞原因与循环分数，再关联累计模型用量并保存本轮指标。"""
         store = getattr(self.retriever, "store", None)
         embed_method = getattr(store, "_embed", None)
         embed = (lambda texts: embed_method(texts)) if callable(embed_method) else None
@@ -472,12 +491,14 @@ class ResearchEngine:
 
     @staticmethod
     def _latest_model_error(run_id: str) -> Optional[Dict[str, Any]]:
+        """读取最近一次失败的模型调用诊断信息；成功记录或没有错误码时返回 None。"""
         with connection() as conn:
             row = conn.execute("SELECT successful,error_code,provider_type,provider_id,model_name,created_at FROM research_model_calls WHERE run_id=? ORDER BY created_at DESC LIMIT 1", (run_id,)).fetchone()
         return dict(row) if row and not row["successful"] and row["error_code"] else None
 
     @staticmethod
     def _effective_resource_policy(run_id: str, config: ContinuousResearchConfig, default_type: str):
+        """依据任务实际使用的提供方选择预算规则；若实际调用了远端模型，则应用远端费用和 Token 上限。"""
         with connection() as conn:
             remote_used = conn.execute("SELECT 1 FROM research_model_calls WHERE run_id=? AND provider_type='REMOTE' LIMIT 1", (run_id,)).fetchone()
         if not remote_used or default_type.upper() == "REMOTE":
@@ -490,11 +511,13 @@ class ResearchEngine:
 
     @staticmethod
     def _emergency_stop_requested() -> bool:
+        """读取全局紧急停止开关，供长时间运行循环在安全检查点主动退出。"""
         with connection() as conn:
             row = conn.execute("SELECT emergency_stop FROM research_control WHERE id=1").fetchone()
         return bool(row and row[0])
 
     def set_emergency_stop(self, enabled: bool):
+        """更新全局紧急停止开关及时间戳，让所有科研运行都能在下一检查点感知该指令。"""
         now = utc_now()
         with connection() as conn:
             conn.execute("UPDATE research_control SET emergency_stop=?,updated_at=? WHERE id=1", (int(enabled), now))
@@ -502,11 +525,13 @@ class ResearchEngine:
 
     @staticmethod
     def emergency_stop_status() -> Dict[str, Any]:
+        """读取紧急停止开关当前值和更新时间，为前端展示系统级运行状态。"""
         with connection() as conn:
             row = conn.execute("SELECT emergency_stop,updated_at FROM research_control WHERE id=1").fetchone()
         return {"enabled": bool(row[0]), "updated_at": row[1]} if row else {"enabled": False, "updated_at": ""}
 
     def _session_summary(self, run: sqlite3.Row, metrics_rows: List[Dict[str, Any]], reason: str) -> Dict[str, Any]:
+        """生成可恢复的会话检查点：记录停止原因、资源统计、研究产出、反例、假设、未解决问题、最新综合结果和建议的恢复条件。"""
         self._checkpoint_runtime(run["id"])
         with connection() as conn:
             metrics_rows = [json.loads(row[0]) for row in conn.execute("SELECT metrics_json FROM research_cycle_metrics WHERE run_id=? ORDER BY cycle_no", (run["id"],)).fetchall()]
@@ -551,6 +576,7 @@ class ResearchEngine:
                 "reason": reason, "resume_conditions": ["添加新的知识库文档", "补充实验或观测数据", "提出新的研究方向", "更换或升级模型", "用户手动恢复"]}
 
     def _final_escape_cycle(self, run: sqlite3.Row, cycle_no: int, metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """自动休眠前安排规划、反例和开放问题角色提出新方向，再由综合评审判断是否值得继续；任何调用仍计入同一任务的模型预算。"""
         context = json.dumps({"question": run["question"], "title": run["title"], "recent_cycles": metrics[-5:]}, ensure_ascii=False)[:9000]
         roles = [
             ("escape_planner", "Research Planner", AGENTS["foundations"].system_prompt, "提出尚未执行的高价值研究路径和可执行下一步。"),
@@ -582,7 +608,7 @@ class ResearchEngine:
                 "next_question": next_question, "output": merged + "\n\n## Meta Research\n" + meta}
 
     def _apply_continuous_policy(self, run: sqlite3.Row, metrics: Dict[str, Any]) -> str:
-        """Apply automatic continuation/stop rules after a completed continuous cycle."""
+        """在每轮结束时应用连续运行策略。硬限制先于模型评审；预算耗尽不会再启动最终逃逸模型调用，软性停滞才有机会探索新方向，之后按决策写入 running/sleeping/stopped 状态和摘要。"""
         config = ContinuousResearchConfig.from_dict(json.loads(run["continuous_config_json"] or "{}"))
         if run["max_rounds"] != 0:
             return "running"
@@ -680,6 +706,7 @@ class ResearchEngine:
         return decision.next_state
 
     def create(self, payload: CreateResearchRun, owner_id: str) -> Dict[str, Any]:
+        """校验并规划专家路由，快照当前模型身份和连续运行预算，创建持久化任务后启动后台线程；创建响应可立即返回，任务详情由前端轮询。"""
         try:
             route = AGENT_ROUTER.route(payload.question, payload.workflow_mode, payload.research_depth, payload.agents)
         except ValueError as exc:
@@ -702,6 +729,7 @@ class ResearchEngine:
         return self._run_dict(self._get_row(run_id, owner_id))
 
     def _start(self, run_id: str):
+        """保证同一科研任务最多由一个后台线程执行；已运行时不重复启动。"""
         with self._lock:
             current = self._threads.get(run_id)
             if current and current.is_alive():
@@ -711,6 +739,7 @@ class ResearchEngine:
             thread.start()
 
     def control(self, run_id: str, owner_id: str, action: str) -> Dict[str, Any]:
+        """处理 pause、stop 和 resume。暂停/停止在当前安全检查点生效；恢复保留既有证据、输出、记忆与模型使用记录，并把本轮失败综合结果回退以便重试。"""
         if not self._get_row(run_id, owner_id):
             raise HTTPException(404, "探索任务不存在")
         with connection() as conn:
@@ -721,9 +750,8 @@ class ResearchEngine:
             elif action == "stop" and status in ("planning", "running", "converging", "queued", "pause_requested"):
                 conn.execute("UPDATE research_runs SET status='cancel_requested', updated_at=? WHERE id=?", (utc_now(), run_id))
             elif action == "resume" and status in ("paused", "failed", "cancelled", "sleeping", "stopped"):
-                # A failed synthesis is stored after current_round advances.
-                # Roll that checkpoint back one round so resume retries the
-                # saved synthesis instead of silently skipping it.
+                # 综合阶段失败时 current_round 已经前进；恢复时回退一个检查点，重试该轮综合，
+                # 避免跳过专家分析并造成最终摘要缺失。
                 failed_synthesis = conn.execute(
                     "SELECT 1 FROM research_outputs WHERE run_id=? AND round_no=? AND agent_id='synthesis' AND status='failed'",
                     (run_id, row["current_round"]),
@@ -740,16 +768,19 @@ class ResearchEngine:
         return self._run_dict(self._get_row(run_id, owner_id))
 
     def _state(self, run_id: str) -> Optional[sqlite3.Row]:
+        """读取科研任务当前完整数据库记录，供编排循环检查状态和恢复进度。"""
         with connection() as conn:
             return conn.execute("SELECT * FROM research_runs WHERE id=?", (run_id,)).fetchone()
 
     @staticmethod
     def _existing_output(run_id: str, round_no: int, agent_id: str) -> Optional[sqlite3.Row]:
+        """查询指定轮次和智能体是否已有输出，以便恢复时复用完成结果或重试失败项。"""
         with connection() as conn:
             return conn.execute("SELECT * FROM research_outputs WHERE run_id=? AND round_no=? AND agent_id=?", (run_id, round_no, agent_id)).fetchone()
 
     @staticmethod
     def _task_stage(agent_id: str) -> str:
+        """把智能体标识映射到检索、专家分析、辩论、综合或逃逸阶段，供进度界面显示。"""
         if agent_id.startswith("escape_"):
             return "escape"
         if agent_id == "retrieval":
@@ -761,6 +792,7 @@ class ResearchEngine:
         return "expert_analysis"
 
     def _set_task(self, run_id: str, round_no: int, agent_id: str, status: str, *, output_id: Optional[str] = None, error: str = ""):
+        """插入或更新任务阶段状态、关联输出和错误信息，并在失败重试时递增尝试次数。"""
         now = utc_now()
         stage = self._task_stage(agent_id)
         with connection() as conn:
@@ -776,12 +808,14 @@ class ResearchEngine:
 
     def _execute_agent(self, run_id: str, round_no: int, agent_id: str, system: str, prompt: str,
                        temperature: float, max_tokens: int) -> str:
+        """通过全局模型提供方调用单个专家，传入轮次、角色和请求用途以记录实际模型/Token/费用；成功输出返回给编排线程保存。"""
         self._set_task(run_id, round_no, agent_id, "running")
         return self._call_model(system, prompt, temperature, max_tokens, run_id=run_id, cycle_no=round_no,
                                 agent_id=agent_id, purpose="agent")
 
     @staticmethod
     def _source_type(source: Dict[str, Any]) -> str:
+        """根据检索提供方和显式元数据归一化来源类型，方便证据按来源类别筛选。"""
         explicit = source.get("source_type")
         if explicit:
             return str(explicit)
@@ -796,7 +830,7 @@ class ResearchEngine:
 
     @staticmethod
     def _extract_claims(content: str) -> List[Dict[str, str]]:
-        """Extract only statements explicitly tagged by the agent prompt."""
+        """只提取提示词要求智能体显式标注的主张类型，不把整段自然语言误作结构化证据。"""
         pattern = re.compile(r"^\s*(?:[-*•]\s*)?\[(finding|internal|external|hypothesis|prediction|counterevidence|limitation)\]\s*(.+?)\s*$", re.IGNORECASE)
         claims = []
         for line in content.splitlines():
@@ -822,6 +856,7 @@ class ResearchEngine:
         return claims[:20]
 
     def _save_output(self, run_id: str, round_no: int, agent_id: str, content: str, sources: List[Dict[str, str]], status: str = "completed"):
+        """持久化智能体输出、来源引用、结构化主张及主张-证据关系，同时更新对应任务的完成/失败状态。相同输出主键以更新方式复用，支持中断后续跑。"""
         now = utc_now()
         output_id = uuid.uuid4().hex
         with connection() as conn:
@@ -875,6 +910,7 @@ class ResearchEngine:
 
     @staticmethod
     def _format_sources(web_sources: List[Dict[str, str]], local_sources: List[Dict[str, str]]) -> str:
+        """清理、去重并规范检索来源字段，生成模型提示词和前端引用可共同使用的格式。"""
         parts = []
         for i, source in enumerate(web_sources[:4], 1):
             parts.append(f"[W{i}] {source['title'][:150]} ({source['provider']})\nURL: {source['url']}\n{source['snippet'][:320]}")
@@ -885,6 +921,7 @@ class ResearchEngine:
     @staticmethod
     def _reserve_model_call(run_id: Optional[str], cycle_no: Optional[int], agent_id: str, purpose: str,
                             provider_id: str, provider_type: str, model_name: str) -> Optional[str]:
+        """使用 SQLite 写锁在发出模型请求前原子预留一次调用，并根据当前提供方预算检查已有成功、失败和进行中的请求，避免并行智能体突破调用上限。"""
         if not run_id:
             return None
         call_id = uuid.uuid4().hex
@@ -919,6 +956,7 @@ class ResearchEngine:
                            provider_id: str, provider_type: str, model_name: str, successful: bool,
                            error_code: str = "", usage: Any = None, duration_seconds: float = 0.0,
                            call_id: Optional[str] = None):
+        """将模型请求最终状态、错误分类、Token、估算费用和耗时写入调用表；若此前已预留名额则更新原记录，保证调用数只计一次。"""
         if not run_id:
             return
         retry_count = 0
@@ -942,6 +980,7 @@ class ResearchEngine:
 
     @staticmethod
     def _resource_usage(run_id: str, provider_type: str, started_at: str, cycles: int, information_gain: float = 0.0) -> Dict[str, Any]:
+        """聚合整个任务的调用状态、Token、币种费用和模型分布；未知用量/价格保留为空，并把未结束的预留调用单独标记为 pending。"""
         with connection() as conn:
             rows = conn.execute("SELECT * FROM research_model_calls WHERE run_id=? ORDER BY created_at", (run_id,)).fetchall()
             run_runtime = conn.execute("SELECT runtime_seconds_total,status,started_at FROM research_runs WHERE id=?", (run_id,)).fetchone()
@@ -1000,6 +1039,7 @@ class ResearchEngine:
     def _call_model(system: str, prompt: str, temperature: float = 0.35, max_tokens: int = 2048,
                     run_id: Optional[str] = None, cycle_no: Optional[int] = None,
                     agent_id: str = "", purpose: str = "agent") -> str:
+        """根据当前全局设置创建本地或远端模型客户端，先预留预算再发请求，成功/失败都会写调用明细；达到硬调用上限时不继续发请求。"""
         started = time.perf_counter()
         provider_id, provider_type, model_name = "unknown", "LOCAL", ""
         call_id = None
@@ -1028,6 +1068,7 @@ class ResearchEngine:
             raise
 
     def _agent_prompt(self, agent_id: str, run: sqlite3.Row, round_no: int, sources: str, previous: str) -> str:
+        """组装单个专家的研究提示词，加入核心问题、历史发现、相关证据及本轮分析要求。"""
         agent = AGENTS[agent_id]
         workflow = WORKFLOWS.get(run["workflow_mode"], WORKFLOWS["multidisciplinary"])
         return (f"研究主题：{run['title']}\n核心问题：{run['question']}\n你的研究职责：{agent.role}\n这是第 {round_no} 轮。\n"
@@ -1038,8 +1079,9 @@ class ResearchEngine:
 
     @staticmethod
     def _synthesis_prompt(title: str, question: str, round_no: int, completed: List[str], review: str = "") -> str:
-        # chatai-local is built with num_ctx=4096. Keep synthesis input bounded
-        # so the prompt, system message, and generation budget fit that window.
+        # 本地 chatai-local 上下文窗口有限；综合提示按字符预算压缩问题和各专家输出，
+        # 为系统提示词和模型生成内容预留空间。
+        """构造本轮多学科综合提示，按固定字符预算截取问题和各专家输出，给小上下文模型留出系统提示和生成空间，并要求区分证据、分歧和推断。"""
         question = question.strip()
         if len(question) > 700:
             question = question[:520] + "……（问题中段略）……" + question[-150:]
@@ -1059,13 +1101,14 @@ class ResearchEngine:
         return header + findings + footer + review
 
     def _work(self, run_id: str):
+        """后台任务主循环：恢复检查点、检索联网/本地来源、并行运行专家、交叉评审并综合；每轮保存输出和指标后检查用户控制及资源策略，异常时记录状态并允许之后续跑。"""
         try:
             initial = self._state(run_id)
             if not initial:
                 return
             parallelism = DEPTH_BUDGETS.get(initial["research_depth"], DEPTH_BUDGETS["normal"])["max_parallel_agents"]
-            # Keep GPU memory predictable on local 8 GB cards while still
-            # running independent agents concurrently.
+            # 并发数受研究档位限制，减少 8 GB 显存设备同时处理多个模型请求的峰值压力；
+            # 同轮专家彼此独立，因此仍可以有限并行。
             with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="science-agent") as pool:
                 while True:
                     run = self._state(run_id)
@@ -1083,6 +1126,7 @@ class ResearchEngine:
                         self._set_status(run_id, "running")
                         run = self._state(run_id)
                     if run["max_rounds"] == 0:
+                        # 每一轮发出新请求前再次检查硬性限制；不能依赖上一轮结束后的软策略阻止越额调用。
                         saved_config = json.loads(run["continuous_config_json"] or "{}")
                         hard_config = ContinuousResearchConfig.from_dict({**saved_config, "auto_sleep_enabled": False})
                         hard_config, effective_provider_type = self._effective_resource_policy(run_id, hard_config, run["provider_type"])
@@ -1107,6 +1151,7 @@ class ResearchEngine:
                         self._set_status(run_id, "completed")
                         return
                     agents = json.loads(run["agents_json"])
+                    # 资料阶段：并行收集当前问题的个人知识库命中和 Crossref/arXiv 来源，分别用 K/W 编号提供给专家。
                     self._set_task(run_id, round_no, "retrieval", "running")
                     try:
                         local_hits = self.retriever.search(run["question"], top_k=4, owner_id=run["owner_id"])
@@ -1142,6 +1187,7 @@ class ResearchEngine:
                             f"待追问题：{'；'.join(claim['text'][:140] for claim in item['open_questions'][:3]) or '无结构化待追问题'}"
                             for item in related_memories)
                     previous = previous[-2200:]
+                    # 专家阶段：已成功保存的检查点直接复用；其他角色提交线程池，所有输出完成后统一写入数据库。
                     pending = []
                     for agent_id in agents:
                         saved = self._existing_output(run_id, round_no, agent_id)
@@ -1210,6 +1256,7 @@ class ResearchEngine:
                             return
                         time.sleep(2)
                         continue
+                    # 评审阶段：只有需要强制质疑的工作流才创建评审与回应角色，避免普通咨询无谓增加模型调用。
                     debate_modes = {"theory_attack", "peer_review", "experiment_design"}
                     debate_limit = DEPTH_BUDGETS.get(run["research_depth"], DEPTH_BUDGETS["normal"])["max_debate_rounds"]
                     if run["workflow_mode"] in debate_modes and debate_limit > 0:
@@ -1252,6 +1299,7 @@ class ResearchEngine:
                                     self._save_output(run_id, round_no, "debate_response", f"研究员回应阶段失败：{str(exc)[:500]}", source_records, "failed")
                             else:
                                 completed.append(f"研究员回应：\n{response_output['content'][:1200]}")
+                    # 综合阶段：优先恢复已有成功综合；否则在固定上下文预算内汇总发现、分歧、反例和来源限制。
                     synthesis = self._existing_output(run_id, round_no, "synthesis")
                     if not synthesis or synthesis["status"] != "completed":
                         review_instruction = ("这是有限轮次的质疑审查，请充当研究评审：逐项判断主要批评是已回应、部分回应还是未解决；指出回应是否有可追溯来源。评审提出质疑不等于质疑已成立，研究员回应也不等于主张已证实。若现有资料无法判断，请保留为未解决问题。" if run["workflow_mode"] in debate_modes else "")
@@ -1285,6 +1333,7 @@ class ResearchEngine:
                     if refreshed["status"] == "pause_requested":
                         self._set_status(run_id, "paused")
                         return
+                    # 检查点阶段：先保留综合结果与开放问题，再统计信息增量，最后应用连续运行的停止/休眠策略。
                     metrics = self._record_cycle_metrics(run_id, round_no, summary,
                         ContinuousResearchConfig.from_dict(json.loads(refreshed["continuous_config_json"] or "{}")))
                     if refreshed["max_rounds"] == 0:
@@ -1301,7 +1350,7 @@ class ResearchEngine:
                     if refreshed["max_rounds"] and round_no >= refreshed["max_rounds"]:
                         self._set_status(run_id, "completed")
                         return
-                    # Avoid an unbounded hot loop when the search/model provider fails.
+                    # 搜索或模型连续失败时暂停一小段时间再重试，避免后台线程形成高频空转。
                     time.sleep(2)
         except Exception as exc:
             ResearchEngine._checkpoint_runtime(run_id)
@@ -1311,6 +1360,7 @@ class ResearchEngine:
 
     @staticmethod
     def _checkpoint_runtime(run_id: str):
+        """把当前活动区间的秒数累加到 runtime_seconds_total，并把区间起点推进到现在；暂停、自动休眠或停止后，续跑能保留整个任务累计运行时长。"""
         now = datetime.now(timezone.utc)
         with connection() as conn:
             run = conn.execute("SELECT started_at,runtime_seconds_total,status FROM research_runs WHERE id=?", (run_id,)).fetchone()
@@ -1325,6 +1375,7 @@ class ResearchEngine:
 
     @staticmethod
     def _runtime_seconds(run_id: str) -> float:
+        """读取已累计运行秒数；若任务目前仍运行，则再加上当前未完成区间，用于时长预算和实时资源展示。"""
         with connection() as conn:
             run = conn.execute("SELECT runtime_seconds_total,started_at,status FROM research_runs WHERE id=?", (run_id,)).fetchone()
         if not run:
@@ -1336,6 +1387,7 @@ class ResearchEngine:
 
     @staticmethod
     def _set_status(run_id: str, status: str):
+        """统一更新任务状态；切换到暂停、完成、停止等非活动状态前先保存运行时长检查点。"""
         if status not in ("running", "planning", "converging"):
             ResearchEngine._checkpoint_runtime(run_id)
         with connection() as conn:
@@ -1344,27 +1396,33 @@ class ResearchEngine:
 
 
 def create_research_router(current_user: Callable[..., Dict], rag_store: Any) -> APIRouter:
+    """创建带登录依赖的科研 API 路由集合，并把共享 RAGStore 包装为科研检索器。内部端点覆盖专家目录、路由预览、任务管理、图谱和紧急停止。"""
     router = APIRouter(prefix="/api/research", tags=["science-exploration"])
     engine = ResearchEngine(rag_store)
 
     @router.get("/agents")
     def research_agents(user: Dict = Depends(current_user)):
+        """返回当前用户可选择的公开科研专家档案，不暴露内部编排智能体。"""
         return [profile.to_public_dict() for profile in AGENT_REGISTRY.list_agents()]
 
     @router.get("/workflows")
     def research_workflows(user: Dict = Depends(current_user)):
+        """返回可用科研工作流及对应深度预算，供创建任务前展示和选择。"""
         return [{**profile.to_public_dict(), "budgets": DEPTH_BUDGETS} for profile in WORKFLOWS.values()]
 
     @router.get("/emergency-stop")
     def research_emergency_stop_status(user: Dict = Depends(current_user)):
+        """返回系统紧急停止开关状态，供前端控制面板同步显示。"""
         return engine.emergency_stop_status()
 
     @router.post("/emergency-stop")
     def research_emergency_stop(payload: EmergencyStopRequest, user: Dict = Depends(current_user)):
+        """接收管理员授权后的紧急停止设置，并立即持久化开关状态。"""
         return engine.set_emergency_stop(payload.enabled)
 
     @router.post("/route")
     def preview_research_route(payload: PreviewRouteRequest, user: Dict = Depends(current_user)):
+        """根据问题、工作流和研究深度预览路由选择；参数不合法时转换为 HTTP 400。"""
         try:
             route = AGENT_ROUTER.route(payload.question, payload.workflow_mode, payload.research_depth, payload.agents)
         except ValueError as exc:
@@ -1379,22 +1437,27 @@ def create_research_router(current_user: Callable[..., Dict], rag_store: Any) ->
 
     @router.get("/runs")
     def research_runs(user: Dict = Depends(current_user)):
+        """列出当前登录用户自己的科研任务，避免跨用户读取任务元数据。"""
         return engine.list_runs(user["id"])
 
     @router.post("/runs", status_code=201)
     def create_research_run(payload: CreateResearchRun, user: Dict = Depends(current_user)):
+        """校验用户提交的探索参数并创建后台任务，返回初始运行状态。"""
         return engine.create(payload, user["id"])
 
     @router.get("/runs/{run_id}")
     def research_run_detail(run_id: str, user: Dict = Depends(current_user)):
+        """返回指定任务的完整研究快照，所有权检查由引擎统一执行。"""
         return engine.get_detail(run_id, user["id"])
 
     @router.get("/runs/{run_id}/graph")
     def research_run_graph(run_id: str, limit_rounds: int = Query(default=50, ge=1, le=500), user: Dict = Depends(current_user)):
+        """返回指定任务的主张、证据和关系图，并限制最大轮数以控制响应规模。"""
         return engine.get_graph(run_id, user["id"], limit_rounds)
 
     @router.post("/runs/{run_id}/{action}")
     def research_run_control(run_id: str, action: str, user: Dict = Depends(current_user)):
+        """校验暂停、继续或停止动作后转交引擎执行状态迁移和检查点恢复。"""
         if action not in ("pause", "resume", "stop"):
             raise HTTPException(404, "操作不存在")
         return engine.control(run_id, user["id"], action)
